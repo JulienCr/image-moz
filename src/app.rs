@@ -217,6 +217,11 @@ impl ImageMozApp {
 
     fn apply_change(&mut self, change: &FsChange) {
         log::debug!("fs change: {change:?}");
+        if let FsChange::Upsert(path) = change
+            && let Some(old) = self.library.get(path)
+        {
+            self.gallery.forget_entry(old);
+        }
         self.library.apply(change, Instant::now());
         self.gallery.library_changed();
     }

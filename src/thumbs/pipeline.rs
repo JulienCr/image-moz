@@ -88,6 +88,20 @@ impl ThumbPipeline {
         }
     }
 
+    /// Lets `key` be requested again (thumb and probe); jobs already in flight are untouched.
+    pub fn forget(&self, key: ThumbKey) {
+        let mut st = self.shared.state.lock().unwrap();
+        st.done.remove(&key);
+        st.probe_done.remove(&key);
+    }
+
+    /// Forgets every finished key, e.g. when the folder changes.
+    pub fn forget_all(&self) {
+        let mut st = self.shared.state.lock().unwrap();
+        st.done.clear();
+        st.probe_done.clear();
+    }
+
     pub fn try_iter(&self) -> Vec<ThumbResult> {
         self.results.try_iter().collect()
     }
@@ -309,6 +323,49 @@ mod tests {
         p.set_wanted(vec![j]);
         thread::sleep(Duration::from_millis(200));
         assert!(p.try_iter().is_empty());
+    }
+
+    #[test]
+    fn forgotten_key_is_produced_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.png");
+        write_png(&src, 64, 64);
+        let j = job(&src);
+        let p = pipeline(&dir.path().join("cache"));
+        let again = || ThumbJob { path: j.path.clone(), key: j.key };
+        p.set_wanted(vec![again()]);
+        p.set_probe(vec![again()]);
+        let mut seen = 0;
+        let start = Instant::now();
+        while seen < 2 {
+            seen += p.try_iter().len();
+            assert!(start.elapsed() < Duration::from_secs(20), "timeout");
+            thread::sleep(Duration::from_millis(10));
+        }
+        p.set_wanted(vec![again()]);
+        p.set_probe(vec![again()]);
+        thread::sleep(Duration::from_millis(200));
+        assert!(p.try_iter().is_empty());
+
+        p.forget(j.key);
+        p.set_wanted(vec![again()]);
+        assert!(matches!(wait_one(&p).outcome, ThumbOutcome::Ready(_)));
+        p.set_probe(vec![again()]);
+        assert!(matches!(wait_one(&p).outcome, ThumbOutcome::Dims((64, 64))));
+    }
+
+    #[test]
+    fn forget_all_clears_every_finished_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.png");
+        write_png(&src, 64, 64);
+        let j = job(&src);
+        let p = pipeline(&dir.path().join("cache"));
+        p.set_wanted(vec![ThumbJob { path: j.path.clone(), key: j.key }]);
+        wait_one(&p);
+        p.forget_all();
+        p.set_wanted(vec![j]);
+        assert!(matches!(wait_one(&p).outcome, ThumbOutcome::Ready(_)));
     }
 
     #[test]

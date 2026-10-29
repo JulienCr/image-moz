@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,18 +11,17 @@ use eframe::egui::{
 use super::status;
 use crate::config::{self, Config};
 use crate::layout::{self, BentoRule, Layout, LayoutItem, LayoutKind, LayoutSection};
-use crate::library::{Library, Section, SortOrder};
+use crate::library::{Entry, Library, Section, SortOrder};
 use crate::selection::Selection;
 use crate::thumbs::{
     DiskCache, ThumbJob, ThumbKey, ThumbOutcome, ThumbPipeline, ThumbResult, key_for,
 };
 
-const MAX_TEXTURES: usize = 400;
+const MIN_TEXTURES: usize = 400;
+const TEXTURE_SLACK: usize = 64;
 const UPLOADS_PER_FRAME: usize = 16;
-const WANTED_CAP: usize = 300;
 const HIGHLIGHT: Duration = Duration::from_millis(1500);
 const DIMS_RELAYOUT_EVERY: Duration = Duration::from_millis(150);
-const RECYCLE_EVERY: Duration = Duration::from_secs(2);
 const PLACEHOLDER: Color32 = Color32::from_gray(44);
 const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
@@ -33,10 +32,16 @@ struct Slot {
 }
 
 /// LRU of GPU textures keyed by file path; a slot is only valid for the key it was made with.
-#[derive(Default)]
 struct TextureCache {
     map: HashMap<PathBuf, Slot>,
     tick: u64,
+    cap: usize,
+}
+
+impl Default for TextureCache {
+    fn default() -> Self {
+        Self { map: HashMap::new(), tick: 0, cap: MIN_TEXTURES }
+    }
 }
 
 impl TextureCache {
@@ -52,11 +57,16 @@ impl TextureCache {
         self.map.get(path).is_some_and(|s| s.key == key)
     }
 
+    /// The cap follows the near-zone tile count so every tile that is drawn or about to be fits.
+    fn fit_cap(&mut self, near_tiles: usize) {
+        self.cap = MIN_TEXTURES.max(near_tiles + TEXTURE_SLACK);
+    }
+
     /// Returns the key of the texture evicted to stay under the cap, if any.
     fn insert(&mut self, path: PathBuf, key: ThumbKey, handle: TextureHandle) -> Option<ThumbKey> {
         self.tick += 1;
         self.map.insert(path, Slot { key, handle, used: self.tick });
-        if self.map.len() <= MAX_TEXTURES {
+        if self.map.len() <= self.cap {
             return None;
         }
         let oldest = self.map.iter().min_by_key(|(_, s)| s.used).map(|(p, _)| p.clone())?;
@@ -109,14 +119,9 @@ pub struct Output {
 }
 
 pub struct Gallery {
-    cache: DiskCache,
-    wake: Arc<dyn Fn() + Send + Sync>,
     pipeline: ThumbPipeline,
     textures: TextureCache,
     backlog: VecDeque<ThumbResult>,
-    /// Keys whose texture was evicted: the pipeline considers them done and will not resend.
-    evicted: HashSet<ThumbKey>,
-    last_recycle: Instant,
     lib_version: u64,
     dims_version: u64,
     sections_key: Option<(u64, SortOrder, bool)>,
@@ -165,16 +170,11 @@ impl Gallery {
             let ctx = ctx.clone();
             Arc::new(move || ctx.request_repaint())
         };
-        let cache = open_cache();
-        let pipeline = ThumbPipeline::new(cache.clone(), wake.clone());
+        let pipeline = ThumbPipeline::new(open_cache(), wake);
         Self {
-            cache,
-            wake,
             pipeline,
             textures: TextureCache::default(),
             backlog: VecDeque::new(),
-            evicted: HashSet::new(),
-            last_recycle: Instant::now(),
             lib_version: 0,
             dims_version: 0,
             sections_key: None,
@@ -211,7 +211,10 @@ impl Gallery {
 
     /// A different folder: drop every texture and forget what the pipeline already produced.
     pub fn reset(&mut self) {
-        self.recycle_pipeline();
+        self.pipeline.set_wanted(Vec::new());
+        self.pipeline.set_probe(Vec::new());
+        self.pipeline.forget_all();
+        self.last_wanted.clear();
         self.textures.clear();
         self.backlog.clear();
         self.sections_key = None;
@@ -222,12 +225,10 @@ impl Gallery {
         self.library_changed();
     }
 
-    fn recycle_pipeline(&mut self) {
-        self.pipeline = ThumbPipeline::new(self.cache.clone(), self.wake.clone());
-        self.evicted.clear();
+    /// The entry is about to be modified on disk or re-read: let its thumb and dims be redone.
+    pub fn forget_entry(&mut self, entry: &Entry) {
+        self.pipeline.forget(key_for(&entry.path, entry.mtime, entry.size));
         self.last_wanted.clear();
-        self.last_recycle = Instant::now();
-        self.probe_dirty = true;
     }
 
     /// Applies finished thumbnail jobs; texture uploads are spread over several frames.
@@ -256,7 +257,7 @@ impl Gallery {
                     let image = ColorImage::from_rgba_unmultiplied(size, thumb.image.as_raw());
                     let handle = ctx.load_texture("thumb", image, TextureOptions::LINEAR);
                     if let Some(old) = self.textures.insert(result.path, result.key, handle) {
-                        self.evicted.insert(old);
+                        self.pipeline.forget(old);
                     }
                 }
                 ThumbOutcome::Dims(dims) => {
@@ -441,14 +442,15 @@ impl Gallery {
         let now = Instant::now();
         let mut fading = false;
         let mut first: Option<(f32, f32, usize)> = None;
+        let mut near_tiles = 0;
         let mut near_jobs: Vec<ThumbJob> = Vec::new();
         let mut far_jobs: Vec<(f32, ThumbJob)> = Vec::new();
 
         for header in &self.layout.headers {
-            let rect = header.rect.translate(origin);
-            if !rect.intersects(viewport) {
+            if !header.rect.intersects(viewport) {
                 continue;
             }
+            let rect = header.rect.translate(origin);
             let meta = &self.meta[header.section];
             let response = ui
                 .interact(rect, Id::new(("section_header", header.section)), Sense::click())
@@ -489,6 +491,7 @@ impl Gallery {
             if !rel.intersects(near) {
                 continue;
             }
+            near_tiles += 1;
             let id = tile.id;
             let path = &self.order[id];
             let key = self.items[id].key;
@@ -570,15 +573,11 @@ impl Gallery {
         }
         far_jobs.sort_by(|a, b| a.0.total_cmp(&b.0));
         near_jobs.extend(far_jobs.into_iter().map(|(_, job)| job));
-        near_jobs.truncate(WANTED_CAP);
+        self.textures.fit_cap(near_tiles);
         self.request_thumbs(near_jobs);
     }
 
     fn request_thumbs(&mut self, jobs: Vec<ThumbJob>) {
-        let needs_resend = jobs.iter().any(|j| self.evicted.contains(&j.key));
-        if needs_resend && self.last_recycle.elapsed() >= RECYCLE_EVERY {
-            self.recycle_pipeline();
-        }
         let keys: Vec<ThumbKey> = jobs.iter().map(|j| j.key).collect();
         if keys != self.last_wanted {
             self.last_wanted = keys;
@@ -617,7 +616,7 @@ mod tests {
         let make = |i: usize| {
             ctx.load_texture(format!("t{i}"), ColorImage::example(), TextureOptions::LINEAR)
         };
-        for i in 0..MAX_TEXTURES {
+        for i in 0..MIN_TEXTURES {
             assert_eq!(cache.insert(PathBuf::from(format!("{i}")), ThumbKey(i as u64), make(i)), None);
         }
         assert!(cache.get(Path::new("0"), ThumbKey(0)).is_some());
@@ -625,6 +624,15 @@ mod tests {
         assert_eq!(evicted, Some(ThumbKey(1)));
         assert!(cache.contains(Path::new("0"), ThumbKey(0)));
         assert!(!cache.contains(Path::new("1"), ThumbKey(1)));
+    }
+
+    #[test]
+    fn cap_follows_near_zone_tile_count() {
+        let mut cache = TextureCache::default();
+        cache.fit_cap(10);
+        assert_eq!(cache.cap, MIN_TEXTURES);
+        cache.fit_cap(900);
+        assert_eq!(cache.cap, 900 + TEXTURE_SLACK);
     }
 
     #[test]
