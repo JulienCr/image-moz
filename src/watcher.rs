@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::Sender;
 use notify::event::{CreateKind, RemoveKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debouncer_opt};
 
 use crate::formats::is_supported;
 use crate::library::FsChange;
@@ -17,6 +17,7 @@ use crate::library::FsChange;
 const DEBOUNCE: Duration = Duration::from_millis(200);
 const TICK: Duration = Duration::from_millis(100);
 const STABLE_FOR: Duration = Duration::from_millis(300);
+const ROOT_CHECK: Duration = Duration::from_secs(1);
 
 type Signature = (u64, Option<SystemTime>);
 
@@ -71,7 +72,7 @@ impl Sink {
 
 /// Watches a folder and forwards stabilized changes; dropping it stops watching.
 pub struct FolderWatcher {
-    _debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
+    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -86,20 +87,34 @@ impl FolderWatcher {
     ) -> notify::Result<FolderWatcher> {
         let sink = Arc::new(Sink { tx, wake, pending: Mutex::new(HashMap::new()) });
         let handler_sink = Arc::clone(&sink);
-        let mut debouncer = new_debouncer(DEBOUNCE, None, move |result: DebounceEventResult| {
-            handle_batch(&handler_sink, recursive, result);
-        })?;
+        // NoCache: the default file-id cache walks and opens every file, blocking for seconds.
+        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+            DEBOUNCE,
+            None,
+            move |result: DebounceEventResult| handle_batch(&handler_sink, recursive, result),
+            NoCache,
+            notify::Config::default(),
+        )?;
         let mode = if recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
         debouncer.watch(root, mode)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let root = root.to_path_buf();
+        let mut root_present = root.is_dir();
         let thread = std::thread::Builder::new()
             .name("watcher-stabilizer".into())
             .spawn(move || {
+                let mut last_check = Instant::now();
                 while !thread_stop.load(Ordering::Relaxed) {
                     std::thread::sleep(TICK);
                     stabilize(&sink);
+                    if last_check.elapsed() >= ROOT_CHECK {
+                        last_check = Instant::now();
+                        if root_toggled(&root, &mut root_present) {
+                            sink.send(FsChange::Rescan);
+                        }
+                    }
                 }
             })
             .map_err(notify::Error::io)?;
@@ -115,6 +130,12 @@ impl Drop for FolderWatcher {
             let _ = thread.join();
         }
     }
+}
+
+/// The OS watcher dies silently with its root, so existence is polled; true on a change.
+fn root_toggled(root: &Path, present: &mut bool) -> bool {
+    let now = root.is_dir();
+    std::mem::replace(present, now) != now
 }
 
 fn handle_batch(sink: &Sink, recursive: bool, result: DebounceEventResult) {
@@ -360,6 +381,31 @@ mod tests {
         assert_eq!(next(&rx), FsChange::Rescan);
         fs::remove_dir(&sub).unwrap();
         assert_eq!(next(&rx), FsChange::Rescan);
+    }
+
+    #[test]
+    fn root_vanishing_and_reappearing_rescans() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("watched");
+        fs::create_dir(&root).unwrap();
+        let (_w, rx) = start(&root, false);
+        fs::remove_dir(&root).unwrap();
+        assert_eq!(next(&rx), FsChange::Rescan);
+        fs::create_dir(&root).unwrap();
+        assert_eq!(next(&rx), FsChange::Rescan);
+    }
+
+    #[test]
+    fn root_toggled_reports_each_transition_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("r");
+        let mut present = false;
+        assert!(!root_toggled(&root, &mut present));
+        fs::create_dir(&root).unwrap();
+        assert!(root_toggled(&root, &mut present));
+        assert!(!root_toggled(&root, &mut present));
+        fs::remove_dir(&root).unwrap();
+        assert!(root_toggled(&root, &mut present));
     }
 
     #[test]
