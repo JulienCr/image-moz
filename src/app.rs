@@ -553,8 +553,8 @@ impl ImageMozApp {
         if out.config_changed {
             self.touch_config();
         }
-        self.apply_tile_events(&out);
         self.remap_selection(ui.ctx());
+        self.apply_tile_events(&out);
     }
 
     fn apply_tile_events(&mut self, out: &gallery::Output) {
