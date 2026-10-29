@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, Context, CornerRadius, CursorIcon, FontId, Id, Margin, Rect,
+    self, Align2, Color32, ColorImage, Context, CornerRadius, CursorIcon, FontId, Id, Margin, Modifiers, Rect,
     ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2,
 };
 
@@ -109,11 +109,22 @@ pub struct View<'a> {
     pub config: &'a mut Config,
     pub root: &'a Path,
     pub selection: &'a Selection,
+    /// Tile id to bring into view this frame.
+    pub scroll_to: Option<usize>,
+}
+
+pub struct TileClick {
+    pub id: usize,
+    pub modifiers: Modifiers,
 }
 
 #[derive(Default)]
 pub struct Output {
     pub hovered: Option<PathBuf>,
+    pub clicked: Option<TileClick>,
+    pub double_clicked: Option<usize>,
+    pub right_clicked: Option<usize>,
+    pub reveal: Option<usize>,
     /// A collapse toggle changed `config.folders`.
     pub config_changed: bool,
 }
@@ -139,6 +150,8 @@ pub struct Gallery {
     /// First visible tile and its y relative to the viewport top, from the previous frame.
     anchor: Option<(PathBuf, f32)>,
     reset_scroll: bool,
+    /// Bumped on every rebuild of `order`.
+    order_version: u64,
 }
 
 fn open_cache() -> DiskCache {
@@ -191,6 +204,7 @@ impl Gallery {
             viewport_h: 0.0,
             anchor: None,
             reset_scroll: false,
+            order_version: 0,
         }
     }
 
@@ -201,6 +215,10 @@ impl Gallery {
     /// Paths of the laid-out tiles in display order; a tile id is an index into it.
     pub fn order(&self) -> &[PathBuf] {
         &self.order
+    }
+
+    pub fn order_version(&self) -> u64 {
+        self.order_version
     }
 
     /// Entries were added, removed or modified: sections and layout must be rebuilt.
@@ -351,6 +369,7 @@ impl Gallery {
             sig.size as f32,
         );
         self.last_layout = Instant::now();
+        self.order_version += 1;
     }
 
     fn update_probes(&mut self, library: &Library) {
@@ -403,6 +422,10 @@ impl Gallery {
         let mut out = Output::default();
         let mut toggled: Option<String> = None;
         let scroll = area.show_viewport(ui, |ui, viewport| {
+            if let Some(tile) = view.scroll_to.and_then(|id| self.layout.tiles.iter().find(|t| t.id == id)) {
+                let origin = ui.max_rect().min.to_vec2();
+                ui.scroll_to_rect(tile.rect.translate(origin), None);
+            }
             self.draw(ui, viewport, &view, width, &mut out, &mut toggled);
         });
         self.scroll_y = scroll.state.offset.y;
@@ -531,13 +554,12 @@ impl Gallery {
                     Color32::from_rgb(230, 160, 40),
                 );
             }
+            let accent = Color32::from_rgb(70, 140, 255);
             if view.selection.contains(id) {
-                painter.rect_stroke(
-                    rect,
-                    CornerRadius::same(2),
-                    Stroke::new(3.0, Color32::from_rgb(70, 140, 255)),
-                    StrokeKind::Inside,
-                );
+                painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(2.0, accent), StrokeKind::Inside);
+            }
+            if view.selection.focus() == Some(id) {
+                painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(4.0, accent), StrokeKind::Inside);
             }
             if let Some(arrived) = entry.and_then(|e| e.arrived_at) {
                 let age = now.saturating_duration_since(arrived);
@@ -556,6 +578,20 @@ impl Gallery {
             if response.hovered() {
                 out.hovered = Some(path.clone());
             }
+            if response.double_clicked() {
+                out.double_clicked = Some(id);
+            } else if response.clicked() {
+                out.clicked = Some(TileClick { id, modifiers: ui.input(|i| i.modifiers) });
+            }
+            if response.secondary_clicked() {
+                out.right_clicked = Some(id);
+            }
+            response.context_menu(|ui| {
+                if ui.button("Afficher dans l'Explorateur").clicked() {
+                    out.reveal = Some(id);
+                    ui.close();
+                }
+            });
             if let Some(entry) = entry {
                 response.on_hover_ui(|ui| {
                     ui.label(egui::RichText::new(&entry.name).strong());

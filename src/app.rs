@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -5,10 +6,13 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui::{self, Context, Frame, Key, Margin};
+use image::RgbaImage;
 
 use crate::config::{Config, MAX_SIZE, MIN_SIZE};
-use crate::layout::{Layout, LayoutKind};
+use crate::formats::{self, DecodeError};
+use crate::layout::{self, Dir, Layout, LayoutKind};
 use crate::library::{self, Entry, FsChange, Library};
+use crate::platform;
 use crate::selection::Selection;
 use crate::ui::gallery::{self, Gallery};
 use crate::ui::status::{self, StatusInfo};
@@ -17,8 +21,25 @@ use crate::watcher::FolderWatcher;
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(1);
 const SIZE_STEP: f32 = 16.0;
+const TOAST_DURATION: Duration = Duration::from_secs(2);
 
 type ScanResult = io::Result<Vec<Entry>>;
+
+struct PendingCopy {
+    files: Vec<PathBuf>,
+    decoded: Receiver<Result<RgbaImage, DecodeError>>,
+}
+
+enum KeyAction {
+    Move(Dir, bool),
+    CopyFiles,
+    CopyPaths,
+    Pin,
+}
+
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
 
 pub struct ImageMozApp {
     config: Config,
@@ -40,6 +61,11 @@ pub struct ImageMozApp {
     hovered: Option<PathBuf>,
     title: String,
     open_requested: bool,
+    scroll_to: Option<usize>,
+    toast: Option<(String, Instant)>,
+    pending_copy: Option<PendingCopy>,
+    /// Order the selection positions refer to, with the gallery version it came from.
+    order_snapshot: (u64, Vec<PathBuf>),
 }
 
 /// The bundled fonts lack arrows (↓ ↑ →); Segoe UI Symbol covers them on Windows.
@@ -93,6 +119,10 @@ impl ImageMozApp {
             hovered: None,
             title: String::new(),
             open_requested: false,
+            scroll_to: None,
+            toast: None,
+            pending_copy: None,
+            order_snapshot: (0, Vec::new()),
         };
         if let Some(folder) = folder {
             app.open_folder(&cc.egui_ctx, folder);
@@ -146,6 +176,8 @@ impl ImageMozApp {
         let recursive = self.config.recursive;
         self.library = Library::new(folder.clone(), recursive);
         self.selection.clear();
+        self.order_snapshot.1.clear();
+        self.pending_copy = None;
         self.hovered = None;
         self.deferred.clear();
         self.rescan_wanted = false;
@@ -317,6 +349,159 @@ impl ImageMozApp {
         if rescan {
             self.rescan_wanted = true;
         }
+        self.handle_gallery_keys(ctx);
+    }
+
+    fn handle_gallery_keys(&mut self, ctx: &Context) {
+        if ctx.egui_wants_keyboard_input() || self.library.is_empty() || self.gallery.order().is_empty() {
+            return;
+        }
+        let action = ctx.input_mut(|i| {
+            let m = i.modifiers;
+            if m.command {
+                // egui-winit turns Ctrl+C into Event::Copy and emits no key event for it.
+                let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+                if m.shift || !copy {
+                    return None;
+                }
+                return Some(if m.alt { KeyAction::CopyPaths } else { KeyAction::CopyFiles });
+            }
+            if m.alt {
+                return None;
+            }
+            for (key, dir) in [
+                (Key::ArrowLeft, Dir::Left),
+                (Key::ArrowRight, Dir::Right),
+                (Key::ArrowUp, Dir::Up),
+                (Key::ArrowDown, Dir::Down),
+            ] {
+                if i.key_pressed(key) {
+                    i.consume_key(m, key);
+                    return Some(KeyAction::Move(dir, m.shift));
+                }
+            }
+            (!m.shift && i.key_pressed(Key::P)).then_some(KeyAction::Pin)
+        });
+        match action {
+            Some(KeyAction::Move(dir, extend)) => self.move_focus(dir, extend),
+            Some(KeyAction::CopyFiles) => self.copy_files(ctx),
+            Some(KeyAction::CopyPaths) => self.copy_paths(ctx),
+            Some(KeyAction::Pin) => self.toggle_focus_pin(),
+            None => {}
+        }
+    }
+
+    fn focus_id(&self) -> Option<usize> {
+        self.selection.focus().filter(|&i| i < self.gallery.order().len())
+    }
+
+    fn move_focus(&mut self, dir: Dir, extend: bool) {
+        let target = match self.focus_id() {
+            Some(from) => layout::neighbor(self.gallery.layout(), from, dir),
+            None => Some(0),
+        };
+        if let Some(target) = target {
+            self.selection.move_to(target, extend);
+            self.scroll_to = Some(target);
+        }
+    }
+
+    fn toggle_focus_pin(&mut self) {
+        let Some(root) = self.root.clone() else { return };
+        let Some(path) = self.focus_id().map(|i| self.gallery.order()[i].clone()) else { return };
+        if self.library.get(&path).is_some() && path.exists() {
+            self.config.toggle_pin(&root, &path);
+            self.touch_config();
+        }
+    }
+
+    /// Absolute paths of the selection, or of the focused tile when nothing is selected.
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let order = self.gallery.order();
+        let mut paths: Vec<PathBuf> =
+            self.selection.selected().filter_map(|i| order.get(i)).map(|p| absolute(p)).collect();
+        if paths.is_empty()
+            && let Some(i) = self.focus_id()
+        {
+            paths.push(absolute(&order[i]));
+        }
+        paths
+    }
+
+    fn notify(&mut self, ctx: &Context, text: String) {
+        self.toast = Some((text, Instant::now()));
+        ctx.request_repaint_after(TOAST_DURATION);
+    }
+
+    fn copy_files(&mut self, ctx: &Context) {
+        let files = self.selected_paths();
+        if files.is_empty() {
+            return;
+        }
+        let Some(focus) = self.focus_id().map(|i| self.gallery.order()[i].clone()) else {
+            self.finish_copy(ctx, files, None);
+            return;
+        };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let wake = Self::wake(ctx);
+        std::thread::spawn(move || {
+            let _ = tx.send(formats::decode(&focus));
+            wake();
+        });
+        self.pending_copy = Some(PendingCopy { files, decoded: rx });
+        self.notify(ctx, "Copie en cours…".to_string());
+    }
+
+    fn poll_copy(&mut self, ctx: &Context) {
+        let Some(pending) = &self.pending_copy else { return };
+        let result = match pending.decoded.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(DecodeError::Unsupported),
+        };
+        let Some(PendingCopy { files, .. }) = self.pending_copy.take() else { return };
+        if let Err(e) = &result {
+            log::warn!("cannot decode image for the clipboard: {e}");
+        }
+        self.finish_copy(ctx, files, result.ok());
+    }
+
+    fn finish_copy(&mut self, ctx: &Context, files: Vec<PathBuf>, bitmap: Option<RgbaImage>) {
+        let text = match platform::copy_files_and_bitmap(&files, bitmap.as_ref()) {
+            Ok(()) => format!("Copié : {} fichier(s)", files.len()),
+            Err(e) => format!("Copie impossible : {e}"),
+        };
+        self.notify(ctx, text);
+    }
+
+    fn copy_paths(&mut self, ctx: &Context) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let text = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\r\n");
+        let message = match platform::copy_text(&text) {
+            Ok(()) => "Chemins copiés".to_string(),
+            Err(e) => format!("Copie impossible : {e}"),
+        };
+        self.notify(ctx, message);
+    }
+
+    /// Re-targets selection positions when the gallery order was rebuilt.
+    fn remap_selection(&mut self, ctx: &Context) {
+        let version = self.gallery.order_version();
+        if version == self.order_snapshot.0 {
+            return;
+        }
+        let new_order = self.gallery.order();
+        if new_order != self.order_snapshot.1.as_slice() {
+            let positions: HashMap<&PathBuf, usize> =
+                new_order.iter().enumerate().map(|(i, p)| (p, i)).collect();
+            let old = &self.order_snapshot.1;
+            self.selection.remap(|i| old.get(i).and_then(|p| positions.get(p).copied()));
+            ctx.request_repaint();
+        }
+        self.order_snapshot = (version, self.gallery.order().to_vec());
     }
 
     fn pick_folder(&mut self, ctx: &Context) {
@@ -347,6 +532,8 @@ impl ImageMozApp {
             return;
         }
         if self.library.is_empty() {
+            self.selection.clear();
+            self.order_snapshot.1.clear();
             let text = if self.scan.is_some() { "Chargement…" } else { "Aucune image dans ce dossier" };
             self.message(ui, text);
             return;
@@ -356,14 +543,45 @@ impl ImageMozApp {
             config: &mut self.config,
             root: &root,
             selection: &self.selection,
+            scroll_to: self.scroll_to.take(),
         };
         let out = self.gallery.show(ui, view);
         if out.hovered != self.hovered {
-            self.hovered = out.hovered;
+            self.hovered = out.hovered.clone();
             ui.ctx().request_repaint();
         }
         if out.config_changed {
             self.touch_config();
+        }
+        self.apply_tile_events(&out);
+        self.remap_selection(ui.ctx());
+    }
+
+    fn apply_tile_events(&mut self, out: &gallery::Output) {
+        if let Some(c) = &out.clicked {
+            if c.modifiers.command {
+                self.selection.ctrl_click(c.id);
+            } else if c.modifiers.shift {
+                self.selection.shift_click(c.id);
+            } else {
+                self.selection.click(c.id);
+            }
+        }
+        if let Some(id) = out.double_clicked {
+            self.selection.click(id);
+            if let Some(path) = self.gallery.order().get(id) {
+                platform::open_default(&absolute(path));
+            }
+        }
+        if let Some(id) = out.right_clicked
+            && !self.selection.contains(id)
+        {
+            self.selection.click(id);
+        }
+        if let Some(id) = out.reveal
+            && let Some(path) = self.gallery.order().get(id)
+        {
+            platform::reveal_in_explorer(&absolute(path));
         }
     }
 
@@ -387,6 +605,7 @@ impl eframe::App for ImageMozApp {
         self.handle_input(&ctx);
         self.pump(&ctx);
         self.gallery.poll(&ctx, &mut self.library);
+        self.poll_copy(&ctx);
         self.sync_title(&ctx);
 
         let events = egui::Panel::top("toolbar")
@@ -397,12 +616,21 @@ impl eframe::App for ImageMozApp {
             .as_deref()
             .or_else(|| self.selection.focus().and_then(|i| self.gallery.order().get(i)).map(PathBuf::as_path))
             .and_then(|p| self.library.get(p));
+        if let Some((_, at)) = &self.toast {
+            let age = at.elapsed();
+            if age >= TOAST_DURATION && self.pending_copy.is_none() {
+                self.toast = None;
+            } else {
+                ctx.request_repaint_after(TOAST_DURATION.saturating_sub(age).max(Duration::from_millis(50)));
+            }
+        }
         let info = StatusInfo {
             entry,
             recursive: self.config.recursive,
             total: self.library.len(),
             selected: self.selection.len(),
             loading: self.scan.is_some(),
+            message: self.toast.as_ref().map(|(t, _)| t.as_str()),
         };
         egui::Panel::bottom("status").show(ui, |ui| status::show(ui, &info));
         let frame = Frame::NONE.fill(ctx.global_style().visuals.panel_fill).inner_margin(Margin::same(6));

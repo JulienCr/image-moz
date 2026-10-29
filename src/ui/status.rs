@@ -60,6 +60,8 @@ pub struct StatusInfo<'a> {
     pub total: usize,
     pub selected: usize,
     pub loading: bool,
+    /// Transient notice; replaces the entry summary while set.
+    pub message: Option<&'a str>,
 }
 
 pub fn show(ui: &mut Ui, info: &StatusInfo) {
@@ -69,7 +71,9 @@ pub fn show(ui: &mut Ui, info: &StatusInfo) {
             ui.separator();
             ui.label(images_text(info.total));
             ui.separator();
-            if let Some(entry) = info.entry {
+            if let Some(message) = info.message {
+                ui.add(Label::new(message).truncate());
+            } else if let Some(entry) = info.entry {
                 ui.add(Label::new(summary(entry, info.recursive)).truncate());
             } else if info.loading {
                 ui.label(egui::RichText::new("Chargement…").weak());
