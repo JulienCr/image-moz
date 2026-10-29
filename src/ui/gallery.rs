@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use eframe::egui::{
 use super::status;
 use crate::config::{self, Config};
 use crate::layout::{self, BentoRule, Layout, LayoutItem, LayoutKind, LayoutSection};
-use crate::library::{Entry, Library, Section, SortOrder};
+use crate::library::{Entry, FsChange, Library, Section, SortOrder};
 use crate::selection::Selection;
 use crate::thumbs::{
     DiskCache, ThumbJob, ThumbKey, ThumbOutcome, ThumbPipeline, ThumbResult, key_for,
@@ -26,14 +26,13 @@ const PLACEHOLDER: Color32 = Color32::from_gray(44);
 const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
 struct Slot {
-    key: ThumbKey,
     handle: TextureHandle,
     used: u64,
 }
 
-/// LRU of GPU textures keyed by file path; a slot is only valid for the key it was made with.
+/// LRU of GPU textures keyed by `ThumbKey`, which is case-insensitive on the path like the library.
 struct TextureCache {
-    map: HashMap<PathBuf, Slot>,
+    map: HashMap<ThumbKey, Slot>,
     tick: u64,
     cap: usize,
 }
@@ -45,16 +44,19 @@ impl Default for TextureCache {
 }
 
 impl TextureCache {
-    fn get(&mut self, path: &Path, key: ThumbKey) -> Option<&TextureHandle> {
+    fn get(&mut self, key: ThumbKey) -> Option<&TextureHandle> {
         self.tick += 1;
-        let tick = self.tick;
-        let slot = self.map.get_mut(path).filter(|s| s.key == key)?;
-        slot.used = tick;
+        let slot = self.map.get_mut(&key)?;
+        slot.used = self.tick;
         Some(&slot.handle)
     }
 
-    fn contains(&self, path: &Path, key: ThumbKey) -> bool {
-        self.map.get(path).is_some_and(|s| s.key == key)
+    fn contains(&self, key: ThumbKey) -> bool {
+        self.map.contains_key(&key)
+    }
+
+    fn remove(&mut self, key: ThumbKey) {
+        self.map.remove(&key);
     }
 
     /// The cap follows the near-zone tile count so every tile that is drawn or about to be fits.
@@ -63,14 +65,14 @@ impl TextureCache {
     }
 
     /// Returns the key of the texture evicted to stay under the cap, if any.
-    fn insert(&mut self, path: PathBuf, key: ThumbKey, handle: TextureHandle) -> Option<ThumbKey> {
+    fn insert(&mut self, key: ThumbKey, handle: TextureHandle) -> Option<ThumbKey> {
         self.tick += 1;
-        self.map.insert(path, Slot { key, handle, used: self.tick });
+        self.map.insert(key, Slot { handle, used: self.tick });
         if self.map.len() <= self.cap {
             return None;
         }
-        let oldest = self.map.iter().min_by_key(|(_, s)| s.used).map(|(p, _)| p.clone())?;
-        self.map.remove(&oldest).map(|s| s.key)
+        let oldest = self.map.iter().min_by_key(|(_, s)| s.used).map(|(k, _)| *k)?;
+        self.map.remove(&oldest).map(|_| oldest)
     }
 
     fn clear(&mut self) {
@@ -179,11 +181,15 @@ fn anchored_offset(new_tile_y: f32, screen_y: f32, content_h: f32, viewport_h: f
 
 impl Gallery {
     pub fn new(ctx: &Context) -> Self {
+        Self::with_cache(ctx, open_cache())
+    }
+
+    fn with_cache(ctx: &Context, cache: DiskCache) -> Self {
         let wake: Arc<dyn Fn() + Send + Sync> = {
             let ctx = ctx.clone();
             Arc::new(move || ctx.request_repaint())
         };
-        let pipeline = ThumbPipeline::new(open_cache(), wake);
+        let pipeline = ThumbPipeline::new(cache, wake);
         Self {
             pipeline,
             textures: TextureCache::default(),
@@ -220,7 +226,7 @@ impl Gallery {
     /// The cached thumbnail texture of tile `id`, if already uploaded.
     pub fn thumbnail(&mut self, id: usize) -> Option<TextureHandle> {
         let key = self.items.get(id)?.key;
-        self.textures.get(self.order.get(id)?, key).cloned()
+        self.textures.get(key).cloned()
     }
 
     pub fn order_version(&self) -> u64 {
@@ -249,10 +255,43 @@ impl Gallery {
         self.library_changed();
     }
 
-    /// The entry is about to be modified on disk or re-read: let its thumb and dims be redone.
+    /// The entry is about to be modified, removed or re-read: let its thumb and dims be redone.
     pub fn forget_entry(&mut self, entry: &Entry) {
-        self.pipeline.forget(key_for(&entry.path, entry.mtime, entry.size));
+        let key = key_for(&entry.path, entry.mtime, entry.size);
+        self.pipeline.forget(key);
+        self.textures.remove(key);
         self.last_wanted.clear();
+    }
+
+    /// Applies a watcher change, releasing the pipeline state of the entry it replaces or drops.
+    pub fn apply_change(&mut self, library: &mut Library, change: &FsChange, now: Instant) {
+        if let FsChange::Upsert(path) | FsChange::Remove(path) = change
+            && let Some(old) = library.get(path)
+        {
+            self.forget_entry(old);
+        }
+        library.apply(change, now);
+        self.library_changed();
+    }
+
+    /// Swaps in a rescan result; entries it no longer contains (or contains changed) are forgotten.
+    pub fn replace_entries(&mut self, library: &mut Library, entries: Vec<Entry>) {
+        let kept: HashSet<ThumbKey> = entries.iter().map(|e| key_for(&e.path, e.mtime, e.size)).collect();
+        for old in library.iter() {
+            if !kept.contains(&key_for(&old.path, old.mtime, old.size)) {
+                self.forget_entry(old);
+            }
+        }
+        library.replace_all(entries);
+        self.library_changed();
+    }
+
+    /// User refresh: failed tiles get another attempt.
+    pub fn retry_failed(&mut self, library: &mut Library) {
+        library.clear_errors();
+        self.pipeline.forget_all();
+        self.last_wanted.clear();
+        self.library_changed();
     }
 
     /// Applies finished thumbnail jobs; texture uploads are spread over several frames.
@@ -265,10 +304,11 @@ impl Gallery {
                 break;
             }
             let Some(result) = self.backlog.pop_front() else { break };
-            let Some(entry) = library.get_mut(&result.path) else { continue };
-            if key_for(&entry.path, entry.mtime, entry.size) != result.key {
+            let current = library.get_mut(&result.path);
+            let Some(entry) = current.filter(|e| key_for(&e.path, e.mtime, e.size) == result.key) else {
+                self.pipeline.forget(result.key);
                 continue;
-            }
+            };
             match result.outcome {
                 ThumbOutcome::Ready(thumb) => {
                     uploads += 1;
@@ -280,7 +320,7 @@ impl Gallery {
                     let size = [thumb.image.width() as usize, thumb.image.height() as usize];
                     let image = ColorImage::from_rgba_unmultiplied(size, thumb.image.as_raw());
                     let handle = ctx.load_texture("thumb", image, TextureOptions::LINEAR);
-                    if let Some(old) = self.textures.insert(result.path, result.key, handle) {
+                    if let Some(old) = self.textures.insert(result.key, handle) {
                         self.pipeline.forget(old);
                     }
                 }
@@ -526,7 +566,7 @@ impl Gallery {
             let key = self.items[id].key;
             let entry = view.library.get(path);
             let in_view = rel.intersects(viewport);
-            let loaded = self.textures.contains(path, key);
+            let loaded = self.textures.contains(key);
             if !loaded && !entry.is_some_and(|e| e.error) {
                 let job = ThumbJob { path: path.clone(), key };
                 if in_view {
@@ -538,7 +578,7 @@ impl Gallery {
             }
             if !in_view {
                 if loaded {
-                    self.textures.get(path, key);
+                    self.textures.get(key);
                 }
                 continue;
             }
@@ -549,7 +589,7 @@ impl Gallery {
             let response = ui.interact(rect, Id::new(("tile", id)), Sense::click());
             let painter = ui.painter();
             painter.rect_filled(rect, CornerRadius::same(2), PLACEHOLDER);
-            if let Some(texture) = self.textures.get(path, key) {
+            if let Some(texture) = self.textures.get(key) {
                 painter.image(texture.id(), fit(rect, texture.size_vec2()), FULL_UV, Color32::WHITE);
             } else if entry.is_some_and(|e| e.error) {
                 painter.text(
@@ -630,6 +670,8 @@ impl Gallery {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
 
     #[test]
@@ -659,13 +701,13 @@ mod tests {
             ctx.load_texture(format!("t{i}"), ColorImage::example(), TextureOptions::LINEAR)
         };
         for i in 0..MIN_TEXTURES {
-            assert_eq!(cache.insert(PathBuf::from(format!("{i}")), ThumbKey(i as u64), make(i)), None);
+            assert_eq!(cache.insert(ThumbKey(i as u64), make(i)), None);
         }
-        assert!(cache.get(Path::new("0"), ThumbKey(0)).is_some());
-        let evicted = cache.insert(PathBuf::from("new"), ThumbKey(999), make(999));
+        assert!(cache.get(ThumbKey(0)).is_some());
+        let evicted = cache.insert(ThumbKey(999), make(999));
         assert_eq!(evicted, Some(ThumbKey(1)));
-        assert!(cache.contains(Path::new("0"), ThumbKey(0)));
-        assert!(!cache.contains(Path::new("1"), ThumbKey(1)));
+        assert!(cache.contains(ThumbKey(0)));
+        assert!(!cache.contains(ThumbKey(1)));
     }
 
     #[test]
@@ -682,9 +724,135 @@ mod tests {
         let ctx = Context::default();
         let mut cache = TextureCache::default();
         let handle = ctx.load_texture("t", ColorImage::example(), TextureOptions::LINEAR);
-        cache.insert(PathBuf::from("a"), ThumbKey(1), handle);
-        assert!(cache.get(Path::new("a"), ThumbKey(2)).is_none());
-        assert!(!cache.contains(Path::new("a"), ThumbKey(2)));
+        cache.insert(ThumbKey(1), handle);
+        assert!(cache.get(ThumbKey(2)).is_none());
+        assert!(!cache.contains(ThumbKey(2)));
+    }
+
+    #[test]
+    fn texture_survives_a_case_only_rename() {
+        let ctx = Context::default();
+        let mut cache = TextureCache::default();
+        let mtime = SystemTime::now();
+        let handle = ctx.load_texture("t", ColorImage::example(), TextureOptions::LINEAR);
+        cache.insert(key_for(Path::new("C:/pics/a.png"), mtime, 10), handle);
+        assert!(cache.contains(key_for(Path::new("C:/pics/A.PNG"), mtime, 10)));
+    }
+
+    fn test_gallery(dir: &Path) -> (Context, Gallery) {
+        let ctx = Context::default();
+        let cache = DiskCache::open(dir.join("cache")).unwrap();
+        let gallery = Gallery::with_cache(&ctx, cache);
+        (ctx, gallery)
+    }
+
+    fn library_of(dir: &Path) -> Library {
+        let mut library = Library::new(dir.to_path_buf(), false);
+        library.replace_all(crate::library::scan(dir, false).unwrap());
+        library
+    }
+
+    fn probe(gallery: &mut Gallery, library: &Library) {
+        gallery.sections = library.sections(SortOrder::default());
+        gallery.library_changed();
+        gallery.update_probes(library);
+    }
+
+    /// Polls the gallery until `done` holds for the entry at `path`, or 5 s elapse.
+    fn settles(
+        ctx: &Context,
+        gallery: &mut Gallery,
+        library: &mut Library,
+        path: &Path,
+        done: impl Fn(&Entry) -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            gallery.poll(ctx, library);
+            if library.get(path).is_some_and(&done) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn has_dims(entry: &Entry) -> bool {
+        entry.dims == Some((40, 20))
+    }
+
+    fn write_image(path: &Path) {
+        image::RgbaImage::from_pixel(40, 20, image::Rgba([1, 2, 3, 255])).save(path).unwrap();
+    }
+
+    #[test]
+    fn removed_then_restored_file_is_probed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("a.png");
+        write_image(&img);
+        let (ctx, mut gallery) = test_gallery(dir.path());
+        let mut library = library_of(dir.path());
+        probe(&mut gallery, &library);
+        assert!(settles(&ctx, &mut gallery, &mut library, &img, has_dims));
+
+        let now = Instant::now();
+        gallery.apply_change(&mut library, &FsChange::Remove(img.clone()), now);
+        gallery.apply_change(&mut library, &FsChange::Upsert(img.clone()), now);
+        assert_eq!(library.get(&img).unwrap().dims, None);
+        probe(&mut gallery, &library);
+        assert!(settles(&ctx, &mut gallery, &mut library, &img, has_dims));
+    }
+
+    #[test]
+    fn file_missing_from_a_rescan_is_probed_again_when_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("a.png");
+        write_image(&img);
+        let (ctx, mut gallery) = test_gallery(dir.path());
+        let mut library = library_of(dir.path());
+        probe(&mut gallery, &library);
+        assert!(settles(&ctx, &mut gallery, &mut library, &img, has_dims));
+
+        gallery.replace_entries(&mut library, Vec::new());
+        gallery.replace_entries(&mut library, crate::library::scan(dir.path(), false).unwrap());
+        probe(&mut gallery, &library);
+        assert!(settles(&ctx, &mut gallery, &mut library, &img, has_dims));
+    }
+
+    #[test]
+    fn discarded_result_does_not_pin_its_key_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("a.png");
+        write_image(&img);
+        let (ctx, mut gallery) = test_gallery(dir.path());
+        let mut library = library_of(dir.path());
+        probe(&mut gallery, &library);
+        while gallery.backlog.is_empty() {
+            gallery.backlog.extend(gallery.pipeline.try_iter());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        library.apply(&FsChange::Remove(img.clone()), Instant::now());
+        gallery.poll(&ctx, &mut library);
+        library.apply(&FsChange::Upsert(img.clone()), Instant::now());
+        probe(&mut gallery, &library);
+        assert!(settles(&ctx, &mut gallery, &mut library, &img, has_dims));
+    }
+
+    #[test]
+    fn retry_failed_gives_broken_files_another_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.png");
+        std::fs::write(&bad, b"not an image").unwrap();
+        let (ctx, mut gallery) = test_gallery(dir.path());
+        let mut library = library_of(dir.path());
+        probe(&mut gallery, &library);
+        assert!(settles(&ctx, &mut gallery, &mut library, &bad, |e| e.error));
+
+        gallery.retry_failed(&mut library);
+        assert!(!library.get(&bad).unwrap().error);
+        probe(&mut gallery, &library);
+        assert!(settles(&ctx, &mut gallery, &mut library, &bad, |e| e.error));
     }
 
     #[test]

@@ -2,12 +2,12 @@
 
 use std::path::PathBuf;
 
-use image_moz::app::ImageMozApp;
+use image_moz::app::{ImageMozApp, folder_to_open};
 
-/// First CLI argument as an absolute path; never canonicalized (no `\\?\` prefix).
+/// First CLI argument as an absolute folder (a file opens its parent); never canonicalized.
 fn cli_folder() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::args_os().nth(1)?);
-    Some(std::path::absolute(&path).unwrap_or(path))
+    folder_to_open(&std::path::absolute(&path).unwrap_or(path))
 }
 
 fn main() -> eframe::Result<()> {

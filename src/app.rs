@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, TryRecvError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui::{self, Context, Frame, Key, Margin};
 use image::RgbaImage;
 
@@ -48,8 +48,27 @@ enum PreviewAction {
     CopyPaths,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FolderIssue {
+    Missing,
+    Unreadable,
+}
+
 fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The folder to browse for a path from the command line or a drop: a file opens its parent.
+pub fn folder_to_open(path: &Path) -> Option<PathBuf> {
+    if path.is_file() { path.parent().map(Path::to_path_buf) } else { Some(path.to_path_buf()) }
+}
+
+/// A key press that is not an OS auto-repeat.
+fn fresh_press(input: &egui::InputState, key: Key) -> bool {
+    input
+        .events
+        .iter()
+        .any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, .. } if *k == key))
 }
 
 pub struct ImageMozApp {
@@ -60,13 +79,14 @@ pub struct ImageMozApp {
     root: Option<PathBuf>,
     library: Library,
     watcher: Option<FolderWatcher>,
+    change_tx: Sender<FsChange>,
     changes: Receiver<FsChange>,
     scan: Option<Receiver<ScanResult>>,
     scan_is_initial: bool,
     rescan_wanted: bool,
     /// Changes received while a scan runs; replayed on top of its result.
     deferred: Vec<FsChange>,
-    folder_missing: bool,
+    folder_issue: Option<FolderIssue>,
     gallery: Gallery,
     pub selection: Selection,
     hovered: Option<PathBuf>,
@@ -111,7 +131,7 @@ impl ImageMozApp {
         let config_path = Config::default_path();
         let config = Config::load(&config_path);
         let folder = cli_folder.or_else(|| config.last_folder.clone());
-        let (_, changes) = crossbeam_channel::unbounded();
+        let (change_tx, changes) = crossbeam_channel::unbounded();
         let mut app = Self {
             library: Library::new(PathBuf::new(), config.recursive),
             config,
@@ -120,12 +140,13 @@ impl ImageMozApp {
             last_save: None,
             root: None,
             watcher: None,
+            change_tx,
             changes,
             scan: None,
             scan_is_initial: false,
             rescan_wanted: false,
             deferred: Vec::new(),
-            folder_missing: false,
+            folder_issue: None,
             gallery: Gallery::new(&cc.egui_ctx),
             selection: Selection::default(),
             hovered: None,
@@ -195,16 +216,13 @@ impl ImageMozApp {
         self.hovered = None;
         self.deferred.clear();
         self.rescan_wanted = false;
-        self.folder_missing = false;
+        self.folder_issue = None;
         self.gallery.reset();
 
         let (tx, rx) = crossbeam_channel::unbounded();
+        self.change_tx = tx;
         self.changes = rx;
-        self.watcher = None;
-        match FolderWatcher::start(&folder, recursive, tx, Self::wake(ctx)) {
-            Ok(watcher) => self.watcher = Some(watcher),
-            Err(e) => log::warn!("cannot watch {}: {e}", folder.display()),
-        }
+        self.arm_watcher(ctx, &folder);
         self.scan_is_initial = true;
         self.start_scan(ctx, &folder);
 
@@ -213,6 +231,22 @@ impl ImageMozApp {
             self.touch_config();
         }
         self.root = Some(folder);
+    }
+
+    /// (Re)starts the watcher on `folder`; false when the OS refuses (e.g. the folder is gone).
+    fn arm_watcher(&mut self, ctx: &Context, folder: &Path) -> bool {
+        self.watcher = None;
+        let (recursive, tx) = (self.config.recursive, self.change_tx.clone());
+        match FolderWatcher::start(folder, recursive, tx, Self::wake(ctx)) {
+            Ok(watcher) => {
+                self.watcher = Some(watcher);
+                true
+            }
+            Err(e) => {
+                log::warn!("cannot watch {}: {e}", folder.display());
+                false
+            }
+        }
     }
 
     fn start_scan(&mut self, ctx: &Context, folder: &Path) {
@@ -226,17 +260,20 @@ impl ImageMozApp {
     }
 
     /// Swaps in a scan result, keeping dims, error and highlight of unchanged files.
-    fn apply_scan(&mut self, result: ScanResult) {
+    fn apply_scan(&mut self, ctx: &Context, result: ScanResult) {
         match result {
             Err(e) => {
                 log::warn!("scan failed: {e}");
-                if self.scan_is_initial || e.kind() == io::ErrorKind::NotFound {
-                    self.library.replace_all(Vec::new());
-                    self.folder_missing = true;
+                let missing = e.kind() == io::ErrorKind::NotFound;
+                if self.scan_is_initial || missing {
+                    self.gallery.replace_entries(&mut self.library, Vec::new());
+                    self.folder_issue = Some(if missing { FolderIssue::Missing } else { FolderIssue::Unreadable });
                 }
             }
             Ok(mut entries) => {
-                self.folder_missing = false;
+                // A watcher that never started, or died with its folder, is re-armed here.
+                let needs_watcher = self.watcher.is_none() || self.folder_issue.is_some();
+                self.folder_issue = None;
                 let now = Instant::now();
                 for entry in &mut entries {
                     match self.library.get(&entry.path) {
@@ -250,12 +287,18 @@ impl ImageMozApp {
                         None => {}
                     }
                 }
-                self.library.replace_all(entries);
+                self.gallery.replace_entries(&mut self.library, entries);
+                if needs_watcher
+                    && let Some(root) = self.root.clone()
+                    && self.arm_watcher(ctx, &root)
+                {
+                    // Changes between the scan and the arming were not watched.
+                    self.rescan_wanted = true;
+                }
             }
         }
         log::debug!("scan applied: {} entries", self.library.len());
         self.scan_is_initial = false;
-        self.gallery.library_changed();
         for change in std::mem::take(&mut self.deferred) {
             self.apply_change(&change);
         }
@@ -263,13 +306,7 @@ impl ImageMozApp {
 
     fn apply_change(&mut self, change: &FsChange) {
         log::debug!("fs change: {change:?}");
-        if let FsChange::Upsert(path) = change
-            && let Some(old) = self.library.get(path)
-        {
-            self.gallery.forget_entry(old);
-        }
-        self.library.apply(change, Instant::now());
-        self.gallery.library_changed();
+        self.gallery.apply_change(&mut self.library, change, Instant::now());
     }
 
     /// Collects scan results and watcher events; at most one scan runs at a time.
@@ -278,7 +315,7 @@ impl ImageMozApp {
             match scan.try_recv() {
                 Ok(result) => {
                     self.scan = None;
-                    self.apply_scan(result);
+                    self.apply_scan(ctx, result);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
@@ -306,11 +343,10 @@ impl ImageMozApp {
 
     fn handle_input(&mut self, ctx: &Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = dropped {
-            let folder = if path.is_dir() { Some(path) } else { path.parent().map(Path::to_path_buf) };
-            if let Some(folder) = folder {
-                self.open_folder(ctx, folder);
-            }
+        if let Some(path) = dropped
+            && let Some(folder) = folder_to_open(&path)
+        {
+            self.open_folder(ctx, folder);
         }
 
         let typing = ctx.egui_wants_keyboard_input();
@@ -364,6 +400,7 @@ impl ImageMozApp {
         }
         if rescan {
             self.rescan_wanted = true;
+            self.gallery.retry_failed(&mut self.library);
         }
         self.handle_gallery_keys(ctx);
     }
@@ -400,7 +437,8 @@ impl ImageMozApp {
                     return Some(KeyAction::Move(dir, m.shift));
                 }
             }
-            if !m.shift && i.consume_key(m, Key::Space) {
+            let fresh_space = fresh_press(i, Key::Space);
+            if !m.shift && i.consume_key(m, Key::Space) && fresh_space {
                 return Some(KeyAction::Open);
             }
             (!m.shift && i.key_pressed(Key::P)).then_some(KeyAction::Pin)
@@ -453,7 +491,9 @@ impl ImageMozApp {
                 return None;
             }
             let none = egui::Modifiers::NONE;
-            if i.consume_key(none, Key::Escape) || i.consume_key(none, Key::Space) {
+            let fresh_space = fresh_press(i, Key::Space);
+            let space = i.consume_key(none, Key::Space) && fresh_space;
+            if i.consume_key(none, Key::Escape) || space {
                 Some(PreviewAction::Close)
             } else if i.consume_key(none, Key::ArrowLeft) {
                 Some(PreviewAction::Step(-1))
@@ -653,8 +693,12 @@ impl ImageMozApp {
             self.message(ui, "Aucun dossier ouvert");
             return;
         };
-        if self.folder_missing {
-            self.message(ui, &format!("Dossier introuvable : {}", root.display()));
+        if let Some(issue) = self.folder_issue {
+            let what = match issue {
+                FolderIssue::Missing => "Dossier introuvable",
+                FolderIssue::Unreadable => "Dossier inaccessible",
+            };
+            self.message(ui, &format!("{what} : {}", root.display()));
             return;
         }
         if self.library.is_empty() {
@@ -715,7 +759,7 @@ impl ImageMozApp {
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() / 3.0).max(0.0));
             ui.heading(text);
-            if self.root.is_none() || self.folder_missing {
+            if self.root.is_none() || self.folder_issue.is_some() {
                 ui.add_space(12.0);
                 if ui.button("Ouvrir").clicked() {
                     self.open_requested = true;
@@ -797,5 +841,49 @@ impl eframe::App for ImageMozApp {
         if self.config_dirty {
             self.save_config();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn space_down() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// egui recomputes `repeat` from the keys already held, so it takes two passes to get one.
+    fn fresh_space_per_pass(passes: usize) -> Vec<bool> {
+        let ctx = Context::default();
+        (0..passes)
+            .map(|_| {
+                let raw = egui::RawInput { events: vec![space_down()], ..Default::default() };
+                let mut fresh = false;
+                let _ = ctx.run_ui(raw, |ui| fresh = ui.input(|i| fresh_press(i, Key::Space)));
+                fresh
+            })
+            .collect()
+    }
+
+    #[test]
+    fn auto_repeat_is_not_a_fresh_press() {
+        assert_eq!(fresh_space_per_pass(3), [true, false, false]);
+    }
+
+    #[test]
+    fn a_file_opens_its_parent_and_a_folder_opens_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.png");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(folder_to_open(&file).as_deref(), Some(dir.path()));
+        assert_eq!(folder_to_open(dir.path()).as_deref(), Some(dir.path()));
+        let missing = dir.path().join("nope");
+        assert_eq!(folder_to_open(&missing), Some(missing));
     }
 }

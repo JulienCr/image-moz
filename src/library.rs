@@ -163,6 +163,17 @@ impl Library {
         self.entries.get_mut(&map_key(path))
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
+        self.entries.values()
+    }
+
+    /// Lets every failed entry be retried.
+    pub fn clear_errors(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.error = false;
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -193,6 +204,7 @@ impl Library {
                 SortOrder::NameAsc => da.to_lowercase().cmp(&db.to_lowercase()),
                 SortOrder::NameDesc => db.to_lowercase().cmp(&da.to_lowercase()),
             })
+            .then_with(|| da.cmp(db))
         });
         sections
             .into_iter()
@@ -298,6 +310,22 @@ mod tests {
             .map(|s| s.rel_dir)
             .collect();
         assert_eq!(dirs, ["", "newer", "older"]);
+    }
+
+    #[test]
+    fn sections_with_equal_sort_keys_are_ordered_by_rel_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let t = SystemTime::now() - Duration::from_secs(50);
+        for name in ["Beta", "alpha", "ALPHA2"] {
+            let p = d.path().join(name).join("x.png");
+            touch(&p, 0);
+            File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+        }
+        for _ in 0..20 {
+            let lib = lib_of(d.path(), true);
+            let dirs: Vec<_> = lib.sections(SortOrder::DateDesc).into_iter().map(|s| s.rel_dir).collect();
+            assert_eq!(dirs, ["ALPHA2", "Beta", "alpha"]);
+        }
     }
 
     #[test]
