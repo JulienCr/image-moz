@@ -22,8 +22,8 @@ impl DiskCache {
     }
 
     pub fn default_dir() -> PathBuf {
-        directories::ProjectDirs::from("", "", "image-moz")
-            .map(|d| d.cache_dir().join("thumbs"))
+        directories::BaseDirs::new()
+            .map(|d| d.data_local_dir().join("image-moz").join("thumbs"))
             .unwrap_or_else(|| std::env::temp_dir().join("image-moz").join("thumbs"))
     }
 
@@ -132,6 +132,13 @@ mod tests {
         assert_ne!(base, key_for(p, t + Duration::from_micros(1), 10));
         assert_ne!(base, key_for(p, t, 11));
         assert_eq!(base, key_for(p, t, 10));
+    }
+
+    #[test]
+    fn default_dir_has_no_cache_component() {
+        let dir = DiskCache::default_dir();
+        assert!(dir.ends_with(Path::new("image-moz").join("thumbs")));
+        assert!(dir.components().all(|c| c.as_os_str() != "cache"));
     }
 
     #[test]

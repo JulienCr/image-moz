@@ -131,14 +131,14 @@ fn worker(
     while let Some(work) = next_work(&shared) {
         let (job, is_probe, outcome) = match work {
             Work::Thumb(job) => {
-                let outcome = make_thumb(&cache, &job);
+                let outcome = guarded(&job, || make_thumb(&cache, &job));
                 (job, false, outcome)
             }
             Work::Probe(job) => {
-                let outcome = match formats::dimensions(&job.path) {
+                let outcome = guarded(&job, || match formats::dimensions(&job.path) {
                     Ok(dims) => ThumbOutcome::Dims(dims),
                     Err(_) => ThumbOutcome::Failed,
-                };
+                });
                 (job, true, outcome)
             }
         };
@@ -162,6 +162,14 @@ fn worker(
         }
         wake();
     }
+}
+
+/// Decoders can panic on malformed input; a panic must become `Failed`, not a dead worker.
+fn guarded(job: &ThumbJob, f: impl FnOnce() -> ThumbOutcome) -> ThumbOutcome {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        log::error!("thumbnail worker panicked on {}", job.path.display());
+        ThumbOutcome::Failed
+    })
 }
 
 fn make_thumb(cache: &DiskCache, job: &ThumbJob) -> ThumbOutcome {
@@ -301,6 +309,16 @@ mod tests {
         p.set_wanted(vec![j]);
         thread::sleep(Duration::from_millis(200));
         assert!(p.try_iter().is_empty());
+    }
+
+    #[test]
+    fn panic_in_job_becomes_failed() {
+        let job = ThumbJob {
+            path: "x".into(),
+            key: ThumbKey(1),
+        };
+        let out = guarded(&job, || panic!("boom"));
+        assert!(matches!(out, ThumbOutcome::Failed));
     }
 
     #[test]
