@@ -217,6 +217,12 @@ impl Gallery {
         &self.order
     }
 
+    /// The cached thumbnail texture of tile `id`, if already uploaded.
+    pub fn thumbnail(&mut self, id: usize) -> Option<TextureHandle> {
+        let key = self.items.get(id)?.key;
+        self.textures.get(self.order.get(id)?, key).cloned()
+    }
+
     pub fn order_version(&self) -> u64 {
         self.order_version
     }

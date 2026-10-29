@@ -13,8 +13,10 @@ use crate::formats::{self, DecodeError};
 use crate::layout::{self, Dir, Layout, LayoutKind};
 use crate::library::{self, Entry, FsChange, Library};
 use crate::platform;
+use crate::preview::PreviewState;
 use crate::selection::Selection;
 use crate::ui::gallery::{self, Gallery};
+use crate::ui::preview_view;
 use crate::ui::status::{self, StatusInfo};
 use crate::ui::toolbar;
 use crate::watcher::FolderWatcher;
@@ -35,6 +37,15 @@ enum KeyAction {
     CopyFiles,
     CopyPaths,
     Pin,
+    Open,
+}
+
+enum PreviewAction {
+    Close,
+    Step(isize),
+    Refit,
+    CopyFiles,
+    CopyPaths,
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -66,6 +77,7 @@ pub struct ImageMozApp {
     pending_copy: Option<PendingCopy>,
     /// Order the selection positions refer to, with the gallery version it came from.
     order_snapshot: (u64, Vec<PathBuf>),
+    preview: Option<PreviewState>,
 }
 
 /// The bundled fonts lack arrows (↓ ↑ →); Segoe UI Symbol covers them on Windows.
@@ -123,6 +135,7 @@ impl ImageMozApp {
             toast: None,
             pending_copy: None,
             order_snapshot: (0, Vec::new()),
+            preview: None,
         };
         if let Some(folder) = folder {
             app.open_folder(&cc.egui_ctx, folder);
@@ -178,6 +191,7 @@ impl ImageMozApp {
         self.selection.clear();
         self.order_snapshot.1.clear();
         self.pending_copy = None;
+        self.preview = None;
         self.hovered = None;
         self.deferred.clear();
         self.rescan_wanted = false;
@@ -300,9 +314,10 @@ impl ImageMozApp {
         }
 
         let typing = ctx.egui_wants_keyboard_input();
+        let browsing = self.preview.is_none();
         let (layout, rescan, zoom) = ctx.input(|i| {
             let plain = !i.modifiers.any();
-            let layout = if typing || !plain {
+            let layout = if typing || !plain || !browsing {
                 None
             } else if i.key_pressed(Key::Num1) {
                 Some(LayoutKind::Grid)
@@ -314,7 +329,7 @@ impl ImageMozApp {
                 None
             };
             let mut zoom = 0;
-            if i.modifiers.command {
+            if browsing && i.modifiers.command {
                 if i.key_pressed(Key::Equals) || i.key_pressed(Key::Plus) {
                     zoom += 1;
                 }
@@ -325,6 +340,7 @@ impl ImageMozApp {
             // Raw events, not zoom_delta(): egui smooths the wheel over several frames.
             for event in &i.events {
                 if let egui::Event::MouseWheel { delta, modifiers, .. } = event
+                    && browsing
                     && modifiers.command
                     && delta.y != 0.0
                 {
@@ -353,6 +369,10 @@ impl ImageMozApp {
     }
 
     fn handle_gallery_keys(&mut self, ctx: &Context) {
+        if self.preview.is_some() {
+            self.handle_preview_keys(ctx);
+            return;
+        }
         if ctx.egui_wants_keyboard_input() || self.library.is_empty() || self.gallery.order().is_empty() {
             return;
         }
@@ -380,6 +400,9 @@ impl ImageMozApp {
                     return Some(KeyAction::Move(dir, m.shift));
                 }
             }
+            if !m.shift && i.consume_key(m, Key::Space) {
+                return Some(KeyAction::Open);
+            }
             (!m.shift && i.key_pressed(Key::P)).then_some(KeyAction::Pin)
         });
         match action {
@@ -387,7 +410,93 @@ impl ImageMozApp {
             Some(KeyAction::CopyFiles) => self.copy_files(ctx),
             Some(KeyAction::CopyPaths) => self.copy_paths(ctx),
             Some(KeyAction::Pin) => self.toggle_focus_pin(),
+            Some(KeyAction::Open) => self.open_preview(ctx),
             None => {}
+        }
+    }
+
+    fn open_preview(&mut self, ctx: &Context) {
+        let Some(id) = self.focus_id() else { return };
+        self.show_preview(ctx, id);
+    }
+
+    /// Opens the preview on tile `id`, or retargets an open one.
+    fn show_preview(&mut self, ctx: &Context, id: usize) {
+        let Some(path) = self.gallery.order().get(id).cloned() else { return };
+        let hint = self
+            .library
+            .get(&path)
+            .and_then(|e| e.dims)
+            .map(|(w, h)| egui::vec2(w as f32, h as f32));
+        match &mut self.preview {
+            Some(preview) => preview.show(ctx, id, path, hint),
+            None => self.preview = Some(PreviewState::open(ctx, id, path, hint)),
+        }
+        self.selection.move_to(id, false);
+        self.scroll_to = Some(id);
+    }
+
+    fn handle_preview_keys(&mut self, ctx: &Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let action = ctx.input_mut(|i| {
+            let m = i.modifiers;
+            if m.command {
+                let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+                if m.shift || !copy {
+                    return None;
+                }
+                return Some(if m.alt { PreviewAction::CopyPaths } else { PreviewAction::CopyFiles });
+            }
+            if m.any() {
+                return None;
+            }
+            let none = egui::Modifiers::NONE;
+            if i.consume_key(none, Key::Escape) || i.consume_key(none, Key::Space) {
+                Some(PreviewAction::Close)
+            } else if i.consume_key(none, Key::ArrowLeft) {
+                Some(PreviewAction::Step(-1))
+            } else if i.consume_key(none, Key::ArrowRight) {
+                Some(PreviewAction::Step(1))
+            } else if i.key_pressed(Key::Num0) {
+                Some(PreviewAction::Refit)
+            } else {
+                None
+            }
+        });
+        match action {
+            Some(PreviewAction::Close) => self.preview = None,
+            Some(PreviewAction::Step(delta)) => self.step_preview(ctx, delta),
+            Some(PreviewAction::Refit) => {
+                if let Some(preview) = &mut self.preview {
+                    preview.fitted = true;
+                }
+            }
+            Some(PreviewAction::CopyFiles) => self.copy_files(ctx),
+            Some(PreviewAction::CopyPaths) => self.copy_paths(ctx),
+            None => {}
+        }
+    }
+
+    fn step_preview(&mut self, ctx: &Context, delta: isize) {
+        let Some(preview) = &self.preview else { return };
+        let target = preview.index.checked_add_signed(delta).filter(|&i| i < self.gallery.order().len());
+        if let Some(target) = target {
+            self.show_preview(ctx, target);
+        }
+    }
+
+    /// Keeps the preview on its file when the gallery order changes underneath it.
+    fn sync_preview(&mut self) {
+        let Some(preview) = &mut self.preview else { return };
+        let order = self.gallery.order();
+        if order.get(preview.index) == Some(&preview.path) {
+            return;
+        }
+        match order.iter().position(|p| *p == preview.path) {
+            Some(i) => preview.index = i,
+            None => self.preview = None,
         }
     }
 
@@ -417,6 +526,9 @@ impl ImageMozApp {
 
     /// Absolute paths of the selection, or of the focused tile when nothing is selected.
     fn selected_paths(&self) -> Vec<PathBuf> {
+        if let Some(preview) = &self.preview {
+            return vec![absolute(&preview.path)];
+        }
         let order = self.gallery.order();
         let mut paths: Vec<PathBuf> =
             self.selection.selected().filter_map(|i| order.get(i)).map(|p| absolute(p)).collect();
@@ -438,7 +550,17 @@ impl ImageMozApp {
         if files.is_empty() {
             return;
         }
-        let Some(focus) = self.focus_id().map(|i| self.gallery.order()[i].clone()) else {
+        let focus = match &self.preview {
+            Some(preview) => {
+                if let Some(img) = preview.decoded_for(&preview.path) {
+                    self.finish_copy(ctx, files, Some((*img).clone()));
+                    return;
+                }
+                Some(preview.path.clone())
+            }
+            None => self.focus_id().map(|i| self.gallery.order()[i].clone()),
+        };
+        let Some(focus) = focus else {
             self.finish_copy(ctx, files, None);
             return;
         };
@@ -608,12 +730,18 @@ impl eframe::App for ImageMozApp {
         self.poll_copy(&ctx);
         self.sync_title(&ctx);
 
-        let events = egui::Panel::top("toolbar")
-            .show(ui, |ui| toolbar::show(ui, &mut self.config))
-            .inner;
+        self.sync_preview();
+        let previewing = self.preview.is_some();
+        let events = if previewing {
+            toolbar::ToolbarEvents::default()
+        } else {
+            egui::Panel::top("toolbar").show(ui, |ui| toolbar::show(ui, &mut self.config)).inner
+        };
         let entry = self
-            .hovered
-            .as_deref()
+            .preview
+            .as_ref()
+            .map(|p| p.path.as_path())
+            .or(self.hovered.as_deref())
             .or_else(|| self.selection.focus().and_then(|i| self.gallery.order().get(i)).map(PathBuf::as_path))
             .and_then(|p| self.library.get(p));
         if let Some((_, at)) = &self.toast {
@@ -633,8 +761,19 @@ impl eframe::App for ImageMozApp {
             message: self.toast.as_ref().map(|(t, _)| t.as_str()),
         };
         egui::Panel::bottom("status").show(ui, |ui| status::show(ui, &info));
-        let frame = Frame::NONE.fill(ctx.global_style().visuals.panel_fill).inner_margin(Margin::same(6));
-        egui::CentralPanel::default().frame(frame).show(ui, |ui| self.central(ui));
+        if previewing {
+            let thumb = self.preview.as_ref().and_then(|p| self.gallery.thumbnail(p.index));
+            let frame = Frame::NONE.fill(preview_view::BACKGROUND);
+            egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+                if let Some(preview) = &mut self.preview {
+                    preview.poll(&ctx);
+                    preview_view::show(ui, preview, thumb.as_ref());
+                }
+            });
+        } else {
+            let frame = Frame::NONE.fill(ctx.global_style().visuals.panel_fill).inner_margin(Margin::same(6));
+            egui::CentralPanel::default().frame(frame).show(ui, |ui| self.central(ui));
+        }
 
         if events.config_changed {
             self.touch_config();
