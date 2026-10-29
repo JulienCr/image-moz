@@ -257,6 +257,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "overwrites the system clipboard"]
     fn clipboard_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("é dossier");
