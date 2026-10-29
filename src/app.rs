@@ -490,6 +490,10 @@ impl ImageMozApp {
     /// Keeps the preview on its file when the gallery order changes underneath it.
     fn sync_preview(&mut self) {
         let Some(preview) = &mut self.preview else { return };
+        if self.library.get(&preview.path).is_none() {
+            self.preview = None;
+            return;
+        }
         let order = self.gallery.order();
         if order.get(preview.index) == Some(&preview.path) {
             return;
