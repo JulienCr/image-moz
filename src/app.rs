@@ -7,6 +7,7 @@ use image::RgbaImage;
 
 use crate::config::{Config, FolderSettings, MAX_SIZE, MIN_SIZE};
 use crate::formats::{self, DecodeError};
+use crate::instance::Primary;
 use crate::layout::{Dir, LayoutKind};
 use crate::platform;
 use crate::tab::{FolderIssue, OpenTarget, Tab, WindowState, absolute, restore_plan, wake};
@@ -85,6 +86,7 @@ pub struct ImageMozApp {
     open_requested: bool,
     toast: Option<(String, Instant)>,
     pending_copy: Option<PendingCopy>,
+    instance: Option<Primary>,
 }
 
 /// The bundled fonts lack arrows (↓ ↑ →); Segoe UI Symbol covers them on Windows.
@@ -111,10 +113,13 @@ fn window_title(root: Option<&Path>) -> String {
 }
 
 impl ImageMozApp {
-    pub fn new(cc: &eframe::CreationContext, cli: Option<OpenTarget>) -> Self {
+    pub fn new(cc: &eframe::CreationContext, cli: Option<OpenTarget>, instance: Option<Primary>) -> Self {
         // Ctrl+= / Ctrl+- resize the thumbnails here, not the whole UI.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         install_symbol_font(&cc.egui_ctx);
+        if let Some(instance) = &instance {
+            instance.set_wake(wake(&cc.egui_ctx));
+        }
         let config_path = Config::default_path();
         let mut app = Self {
             config: Config::load(&config_path),
@@ -127,6 +132,7 @@ impl ImageMozApp {
             open_requested: false,
             toast: None,
             pending_copy: None,
+            instance,
         };
         app.restore_session(&cc.egui_ctx);
         if let Some(target) = cli {
@@ -200,6 +206,22 @@ impl ImageMozApp {
             self.thumbs.cancel_requests();
         }
         ctx.request_repaint();
+    }
+
+    /// Opens what another launch forwarded and brings the window forward.
+    fn handle_forwarded(&mut self, ctx: &Context) {
+        let Some(instance) = &self.instance else { return };
+        let forwarded = instance.try_iter();
+        for path in forwarded {
+            log::debug!("forwarded from another launch: {path:?}");
+            if let Some(path) = path {
+                self.open_path(ctx, &path);
+            }
+            if ctx.input(|i| i.viewport().minimized) == Some(true) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
     }
 
     /// Collects scan results and watcher events of every tab, then thumbnail results.
@@ -588,6 +610,7 @@ fn message(ui: &mut egui::Ui, text: &str, with_open: bool) -> bool {
 impl eframe::App for ImageMozApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.handle_forwarded(&ctx);
         self.handle_input(&ctx);
         self.pump(&ctx);
         self.poll_copy(&ctx);

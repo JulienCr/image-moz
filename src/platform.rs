@@ -5,7 +5,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM};
 use windows::Win32::Graphics::Gdi::{BI_BITFIELDS, BITMAPV5HEADER};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
@@ -15,8 +15,11 @@ use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
 };
 use windows::Win32::UI::Shell::{DROPFILES, DragQueryFileW, HDROP, ShellExecuteW};
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{PCWSTR, w};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOWNORMAL,
+    SetForegroundWindow, ShowWindowAsync,
+};
+use windows::core::{BOOL, PCWSTR, w};
 
 const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
@@ -249,6 +252,33 @@ pub fn reveal_in_explorer(path: &Path) {
         .spawn()
     {
         log::warn!("explorer.exe failed for {}: {e}", path.display());
+    }
+}
+
+unsafe extern "system" fn first_own_window(hwnd: HWND, found: LPARAM) -> BOOL {
+    let found = found.0 as *mut Option<HWND>;
+    let mut owner = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) };
+    let top_level = unsafe { GetWindow(hwnd, GW_OWNER) }.map_or(true, |owner| owner.0.is_null());
+    if owner == std::process::id() && top_level && unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        unsafe { *found = Some(hwnd) };
+        return BOOL(0);
+    }
+    BOOL(1)
+}
+
+/// Restores and raises this process's main window from a non-UI thread.
+///
+/// A minimized egui window runs no frames, so the UI thread cannot do this itself.
+pub fn raise_own_window() {
+    let mut found: Option<HWND> = None;
+    let _ = unsafe { EnumWindows(Some(first_own_window), LPARAM(&mut found as *mut _ as isize)) };
+    let Some(hwnd) = found else { return };
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 

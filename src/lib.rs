@@ -1,6 +1,7 @@
 pub mod app;
 pub mod config;
 pub mod formats;
+pub mod instance;
 pub mod layout;
 pub mod library;
 pub mod platform;
