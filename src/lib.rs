@@ -1,6 +1,7 @@
 pub mod app;
 pub mod config;
 pub mod formats;
+pub mod geometry;
 pub mod instance;
 pub mod layout;
 pub mod library;
@@ -11,3 +12,4 @@ pub mod tab;
 pub mod thumbs;
 pub mod ui;
 pub mod watcher;
+pub mod windows;

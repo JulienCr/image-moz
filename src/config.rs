@@ -27,18 +27,30 @@ pub struct FolderSettings {
     pub sort: SortOrder,
 }
 
-/// One window's tabs; a new field here (e.g. bounds) loads from older files through `default`.
+/// Outer position and inner size of a window, in physical pixels.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowBounds {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One window's tabs; a new field here loads from older files through `default`.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct WindowSession {
     pub tabs: Vec<PathBuf>,
     pub active: usize,
+    pub bounds: Option<WindowBounds>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Session {
     pub windows: Vec<WindowSession>,
+    /// Index in `windows` of the window that was active last.
+    pub active_window: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -155,7 +167,7 @@ impl Config {
         let state = self.folder_mut(&folder);
         state.recursive = recursive.unwrap_or(state.recursive);
         state.sort = sort.unwrap_or(state.sort);
-        self.session.windows.push(WindowSession { tabs: vec![folder], active: 0 });
+        self.session.windows.push(WindowSession { tabs: vec![folder], active: 0, bounds: None });
     }
 
     pub fn folder_settings(&self, folder: &Path) -> FolderSettings {
@@ -213,7 +225,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("config.json");
         let mut cfg = Config { target_size: 300.0, ..Config::default() };
-        cfg.session.windows.push(WindowSession { tabs: vec![PathBuf::from(r"D:\Pics")], active: 0 });
+        cfg.session.windows = vec![
+            WindowSession {
+                tabs: vec![PathBuf::from(r"D:\Pics"), PathBuf::from(r"D:\Other")],
+                active: 1,
+                bounds: Some(WindowBounds { x: -1200, y: 40, width: 1100, height: 700 }),
+            },
+            WindowSession { tabs: vec![PathBuf::from(r"E:\Renders")], active: 0, bounds: None },
+        ];
+        cfg.session.active_window = 1;
         cfg.set_folder_settings(
             Path::new(r"D:\Pics"),
             FolderSettings { recursive: true, sort: SortOrder::NameDesc },
@@ -264,7 +284,8 @@ mod tests {
         }"#;
         std::fs::write(&path, old).unwrap();
         let cfg = Config::load(&path);
-        assert_eq!(cfg.session.windows, [WindowSession { tabs: vec![PathBuf::from(r"D:\Pics")], active: 0 }]);
+        let expected = WindowSession { tabs: vec![PathBuf::from(r"D:\Pics")], active: 0, bounds: None };
+        assert_eq!(cfg.session.windows, [expected]);
         assert_eq!(
             cfg.folder_settings(Path::new(r"D:\Pics")),
             FolderSettings { recursive: true, sort: SortOrder::NameAsc }
@@ -276,6 +297,18 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("last_folder"));
         assert_eq!(Config::load(&path), cfg);
+    }
+
+    #[test]
+    fn a_session_written_before_window_bounds_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let json = r#"{"session":{"windows":[{"tabs":["D:\\A"],"active":0},{"tabs":["D:\\B"],"active":0}]}}"#;
+        std::fs::write(&path, json).unwrap();
+        let cfg = Config::load(&path);
+        assert_eq!(cfg.session.windows.len(), 2);
+        assert!(cfg.session.windows.iter().all(|w| w.bounds.is_none()));
+        assert_eq!(cfg.session.active_window, 0);
     }
 
     #[test]
