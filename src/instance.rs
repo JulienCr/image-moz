@@ -70,8 +70,10 @@ pub struct Names {
 }
 
 impl Names {
+    /// `IMAGE_MOZ_INSTANCE` scopes the names when set, so a test run never meets the user's instance.
     pub fn for_current_user() -> Self {
-        Self::new(&std::env::var("USERNAME").unwrap_or_default())
+        let scope = std::env::var("IMAGE_MOZ_INSTANCE").ok().filter(|s| !s.is_empty());
+        Self::new(&scope.unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_default()))
     }
 
     fn new(scope: &str) -> Self {

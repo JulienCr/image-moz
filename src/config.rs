@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 pub const MIN_SIZE: f32 = 64.0;
 pub const MAX_SIZE: f32 = 512.0;
 pub const DEFAULT_SIZE: f32 = 192.0;
+/// Names a directory holding `config.json` instead of the roaming app data one; used by the end-to-end suite.
+pub const CONFIG_DIR_ENV: &str = "IMAGE_MOZ_CONFIG_DIR";
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -115,6 +117,13 @@ pub fn rel_key(folder: &Path, file: &Path) -> Option<String> {
 
 impl Config {
     pub fn default_path() -> PathBuf {
+        Self::path_with_override(std::env::var_os(CONFIG_DIR_ENV))
+    }
+
+    fn path_with_override(dir: Option<std::ffi::OsString>) -> PathBuf {
+        if let Some(dir) = dir.filter(|d| !d.is_empty()) {
+            return PathBuf::from(dir).join("config.json");
+        }
         let base = BaseDirs::new()
             .map(|d| d.config_dir().to_path_buf())
             .unwrap_or_default();
@@ -359,6 +368,13 @@ mod tests {
         assert_eq!(Config::load(&path).target_size, MAX_SIZE);
         std::fs::write(&path, r#"{"target_size":1}"#).unwrap();
         assert_eq!(Config::load(&path).target_size, MIN_SIZE);
+    }
+
+    #[test]
+    fn the_config_dir_can_be_redirected() {
+        let path = Config::path_with_override(Some(r"D:\sandbox".into()));
+        assert_eq!(path, Path::new(r"D:\sandbox").join("config.json"));
+        assert!(Config::path_with_override(Some("".into())).ends_with(Path::new(r"image-moz\config.json")));
     }
 
     #[test]
