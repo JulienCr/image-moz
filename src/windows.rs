@@ -1,6 +1,7 @@
 //! The set of windows and who owns which tab: moves, detaches, closes and the root window's succession.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::config::{self, Session, WindowBounds, WindowSession};
 use crate::geometry::{BarGeometry, Fitted};
@@ -10,6 +11,50 @@ pub type WindowId = u64;
 
 /// The window eframe owns; it can be emptied and refilled but never removed.
 pub const ROOT: WindowId = 0;
+
+/// How long a new window is nudged towards its intended bounds, which a monitor with another scale can distort.
+const SETTLE_FOR: Duration = Duration::from_secs(3);
+const SETTLE_ATTEMPTS: u8 = 8;
+/// The bounds must hold this long: a scale change after the move can undo them.
+const SETTLE_HOLD: Duration = Duration::from_millis(400);
+
+/// Where a window was asked to open, kept until the native window reports it is there.
+pub struct Placement {
+    pub target: WindowBounds,
+    since: Instant,
+    attempts: u8,
+    holding_since: Option<Instant>,
+}
+
+impl Placement {
+    pub fn new(target: WindowBounds) -> Self {
+        Self { target, since: Instant::now(), attempts: 0, holding_since: None }
+    }
+
+    /// What to do after seeing the window at `actual` (within `tolerance` px of the target or not).
+    pub fn step(&mut self, matches: bool) -> Step {
+        if self.since.elapsed() >= SETTLE_FOR {
+            return Step::Done;
+        }
+        if matches {
+            let held = *self.holding_since.get_or_insert_with(Instant::now);
+            return if held.elapsed() >= SETTLE_HOLD { Step::Done } else { Step::Wait };
+        }
+        self.holding_since = None;
+        self.attempts += 1;
+        if self.attempts > SETTLE_ATTEMPTS { Step::Done } else { Step::Correct }
+    }
+}
+
+/// What a window that should be somewhere else needs next.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Resend the target bounds.
+    Correct,
+    /// At the target, but not for long enough to trust it yet.
+    Wait,
+    Done,
+}
 
 pub struct AppWindow {
     pub id: WindowId,
@@ -21,11 +66,14 @@ pub struct AppWindow {
     pub hwnd: Option<isize>,
     /// Tab bar rects of the current frame; `None` when the window drew none.
     pub geometry: Option<BarGeometry>,
+    pub placement: Option<Placement>,
+    /// Title last sent to the native window.
+    pub title: String,
 }
 
 impl AppWindow {
     fn new(id: WindowId, state: WindowState) -> Self {
-        Self { id, state, initial: None, bounds: None, hwnd: None, geometry: None }
+        Self { id, state, initial: None, bounds: None, hwnd: None, geometry: None, placement: None, title: String::new() }
     }
 }
 
@@ -84,6 +132,15 @@ impl Windows {
         self.list.iter_mut().find(|w| w.id == id)
     }
 
+    /// The tabs of a window that must exist, e.g. the one being drawn.
+    pub fn state(&self, id: WindowId) -> &WindowState {
+        &self.get(id).expect("the window being drawn exists").state
+    }
+
+    pub fn state_mut(&mut self, id: WindowId) -> &mut WindowState {
+        &mut self.get_mut(id).expect("the window being drawn exists").state
+    }
+
     /// Marks `id` as the window the user touched last.
     pub fn touch(&mut self, id: WindowId) {
         if self.get(id).is_some() {
@@ -102,6 +159,11 @@ impl Windows {
         self.next_id += 1;
         let mut window = AppWindow::new(id, state);
         window.initial = initial;
+        window.bounds = initial.and_then(|f| {
+            let (x, y) = f.position?;
+            Some(WindowBounds { x, y, width: f.size.0, height: f.size.1 })
+        });
+        window.placement = window.bounds.map(Placement::new);
         self.list.push(window);
         self.touch(id);
         id
@@ -498,6 +560,23 @@ mod tests {
         assert_eq!(active, 0);
         let stale = Session { active_window: 0, ..session };
         assert_eq!(session_plan(&stale, |p| p.to_string_lossy() != "gone").1, 0);
+    }
+
+    #[test]
+    fn a_placement_is_trusted_only_after_it_has_held() {
+        let target = WindowBounds { x: 0, y: 0, width: 10, height: 10 };
+        let mut placement = Placement::new(target);
+        assert_eq!(placement.step(false), Step::Correct);
+        assert_eq!(placement.step(true), Step::Wait);
+        assert_eq!(placement.step(false), Step::Correct);
+        assert_eq!(placement.step(true), Step::Wait);
+        std::thread::sleep(SETTLE_HOLD + Duration::from_millis(50));
+        assert_eq!(placement.step(true), Step::Done);
+        let mut stubborn = Placement::new(target);
+        for _ in 0..SETTLE_ATTEMPTS {
+            assert_eq!(stubborn.step(false), Step::Correct);
+        }
+        assert_eq!(stubborn.step(false), Step::Done);
     }
 
     #[test]

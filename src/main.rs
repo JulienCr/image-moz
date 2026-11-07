@@ -2,8 +2,10 @@
 
 use std::path::PathBuf;
 
-use image_moz::app::ImageMozApp;
+use image_moz::app::{ImageMozApp, Startup};
+use image_moz::config::Config;
 use image_moz::instance::{self, Acquired, Names, Primary};
+use image_moz::platform;
 use image_moz::tab::absolute;
 
 const TITLE: &str = "Image Moz";
@@ -34,19 +36,15 @@ fn claim_instance(cli: Option<&std::path::Path>) -> Option<Option<Primary>> {
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
+    platform::enable_dpi_awareness();
     let cli = cli_path();
     let Some(instance) = claim_instance(cli.as_deref()) else { return Ok(()) };
     let target = cli.as_deref().and_then(image_moz::tab::OpenTarget::from_path);
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title(TITLE)
-            .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([480.0, 320.0]),
-        ..Default::default()
-    };
+    let startup = Startup::from_config(Config::load(&Config::default_path()));
+    let options = eframe::NativeOptions { viewport: startup.root_viewport(), ..Default::default() };
     eframe::run_native(
         TITLE,
         options,
-        Box::new(move |cc| Ok(Box::new(ImageMozApp::new(cc, target, instance)))),
+        Box::new(move |cc| Ok(Box::new(ImageMozApp::new(cc, startup, target, instance)))),
     )
 }

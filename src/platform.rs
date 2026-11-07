@@ -316,15 +316,16 @@ pub fn foreground_own_window() -> Option<isize> {
     (owner == std::process::id() && !hwnd.0.is_null()).then(|| from_handle(hwnd))
 }
 
-/// The window of this process whose outer rectangle is `rect` (physical pixels, within 2 px).
-pub fn find_own_window(rect: PxRect) -> Option<isize> {
-    own_windows().into_iter().find(|&hwnd| {
+/// A window of this process, other than `taken`, whose outer rectangle is `rect` (physical pixels, within 2 px).
+pub fn find_own_window(rect: PxRect, taken: &[isize]) -> Option<isize> {
+    let close = |hwnd: &HWND| {
         let mut r = RECT::default();
-        unsafe { GetWindowRect(hwnd, &mut r) }.is_ok()
+        unsafe { GetWindowRect(*hwnd, &mut r) }.is_ok()
             && [r.left - rect.left, r.top - rect.top, r.right - rect.right, r.bottom - rect.bottom]
                 .iter()
                 .all(|d| d.abs() <= 2)
-    }).map(from_handle)
+    };
+    own_windows().into_iter().filter(|h| !taken.contains(&from_handle(*h))).find(close).map(from_handle)
 }
 
 /// The top-level window under a screen point, of any process.

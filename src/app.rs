@@ -1,30 +1,63 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, TryRecvError};
-use eframe::egui::{self, Context, Frame, Key, Margin, Modifiers};
+use eframe::egui::{
+    self, Color32, Context, CornerRadius, Frame, IconData, Id, Key, Margin, Modifiers, Pos2, Rect, ViewportBuilder,
+    ViewportCommand, ViewportId, pos2, vec2,
+};
 use image::RgbaImage;
 
-use crate::config::{Config, FolderSettings, MAX_SIZE, MIN_SIZE};
+use crate::config::{Config, FolderSettings, MAX_SIZE, MIN_SIZE, WindowBounds};
 use crate::formats::{self, DecodeError};
+use crate::geometry::{self, BarGeometry, Fitted, PxRect};
 use crate::instance::Primary;
 use crate::layout::{Dir, LayoutKind};
 use crate::platform;
-use crate::tab::{FolderIssue, OpenTarget, Tab, WindowState, absolute, restore_plan, wake};
+use crate::tab::{FolderIssue, OpenTarget, Tab, WindowState, absolute, wake};
 use crate::ui::gallery::{self, Thumbs};
 use crate::ui::preview_view;
 use crate::ui::status::{self, StatusInfo};
-use crate::ui::tabbar::{self, TabBarEvents};
+use crate::ui::tabbar::{self, DragView, TabBarEvents};
 use crate::ui::toolbar;
+use crate::windows::{Change, Placement, ROOT, Step, WindowId, WindowPlan, Windows, session_plan};
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(1);
 const SIZE_STEP: f32 = 16.0;
 const TOAST_DURATION: Duration = Duration::from_secs(2);
 const APP_NAME: &str = "Image Moz";
+const DEFAULT_SIZE: (f32, f32) = (1200.0, 800.0);
+const MIN_SIZE_PTS: [f32; 2] = [480.0, 320.0];
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
 
 struct PendingCopy {
+    window: WindowId,
     files: Vec<PathBuf>,
     decoded: Receiver<Result<RgbaImage, DecodeError>>,
+}
+
+struct Toast {
+    window: WindowId,
+    text: String,
+    at: Instant,
+}
+
+/// Where a released tab would land: a window and the slot among its tabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DropTarget {
+    window: WindowId,
+    index: usize,
+}
+
+/// A tab being dragged. The window that started it keeps the mouse capture, so the
+/// release is read from the global button state rather than from egui.
+struct TabDrag {
+    tab_id: u64,
+    label: String,
+    cursor_px: Pos2,
+    target: Option<DropTarget>,
 }
 
 enum KeyAction {
@@ -81,12 +114,89 @@ pub struct ImageMozApp {
     config_dirty: bool,
     last_save: Option<Instant>,
     thumbs: Thumbs,
-    window: WindowState,
-    title: String,
+    windows: Windows,
+    /// The window whose UI is being built; every per-window method acts on it.
+    cur: WindowId,
+    drag: Option<TabDrag>,
+    icon: Option<Arc<IconData>>,
+    /// Pixels per point a new window starts with, used to turn stored pixels into points.
+    scale: f32,
+    /// Pixels per point of the root window, for placing it after another window replaced it.
+    root_scale: f32,
+    /// Windows whose title bar close button was pressed this frame.
+    closing: Vec<WindowId>,
     open_requested: bool,
-    toast: Option<(String, Instant)>,
+    toast: Option<Toast>,
     pending_copy: Option<PendingCopy>,
     instance: Option<Primary>,
+    published_target: isize,
+}
+
+/// Everything decided before the first window exists: the session to restore and the root's placement.
+pub struct Startup {
+    config: Config,
+    plans: Vec<WindowPlan>,
+    active_window: usize,
+    icon: Option<Arc<IconData>>,
+    monitors: Vec<PxRect>,
+    scale: f32,
+    /// Where the root was asked to open, when its stored position is still on a monitor.
+    root_placement: Option<WindowBounds>,
+}
+
+fn load_icon() -> Option<Arc<IconData>> {
+    match eframe::icon_data::from_png_bytes(ICON_PNG) {
+        Ok(icon) => Some(Arc::new(icon)),
+        Err(e) => {
+            log::warn!("cannot decode the window icon: {e}");
+            None
+        }
+    }
+}
+
+/// Builder for a window; `fitted` is `None` for the default size and a system-chosen position.
+fn window_builder(title: String, fitted: Option<Fitted>, scale: f32, icon: Option<Arc<IconData>>) -> ViewportBuilder {
+    let (width, height) = fitted.map_or(DEFAULT_SIZE, |f| (f.size.0 as f32 / scale, f.size.1 as f32 / scale));
+    let mut builder = ViewportBuilder::default()
+        .with_title(title)
+        .with_inner_size([width, height])
+        .with_min_inner_size(MIN_SIZE_PTS);
+    if let Some((x, y)) = fitted.and_then(|f| f.position) {
+        builder = builder.with_position([x as f32 / scale, y as f32 / scale]);
+    }
+    if let Some(icon) = icon {
+        builder = builder.with_icon(icon);
+    }
+    builder
+}
+
+impl Startup {
+    pub fn from_config(config: Config) -> Self {
+        let (plans, active_window) = session_plan(&config.session, Path::is_dir);
+        let (monitors, scale) = (platform::monitor_work_areas(), platform::system_scale());
+        let root_fit = plans.first().and_then(|p| p.bounds).map(|b| geometry::fit_to_monitors(b, &monitors, scale));
+        let root_placement = root_fit.and_then(|f| {
+            let (x, y) = f.position?;
+            Some(WindowBounds { x, y, width: f.size.0, height: f.size.1 })
+        });
+        Self { config, plans, active_window, icon: load_icon(), monitors, scale, root_placement }
+    }
+
+    /// The root viewport, placed where the first stored window was when it is still on a monitor.
+    pub fn root_viewport(&self) -> ViewportBuilder {
+        let stored = self.plans.first().and_then(|p| p.bounds);
+        let fitted = stored.map(|b| geometry::fit_to_monitors(b, &self.monitors, self.scale));
+        window_builder(APP_NAME.to_string(), fitted, self.scale, self.icon.clone())
+    }
+}
+
+fn viewport_id(window: WindowId) -> ViewportId {
+    if window == ROOT { ViewportId::ROOT } else { ViewportId::from_hash_of(("image-moz-window", window)) }
+}
+
+fn px_rect(rect: Rect, scale: f32) -> PxRect {
+    let px = |v: f32| (v * scale).round() as i32;
+    PxRect { left: px(rect.min.x), top: px(rect.min.y), right: px(rect.max.x), bottom: px(rect.max.y) }
 }
 
 /// The bundled fonts lack arrows (↓ ↑ →); Segoe UI Symbol covers them on Windows.
@@ -113,41 +223,66 @@ fn window_title(root: Option<&Path>) -> String {
 }
 
 impl ImageMozApp {
-    pub fn new(cc: &eframe::CreationContext, cli: Option<OpenTarget>, instance: Option<Primary>) -> Self {
+    pub fn new(cc: &eframe::CreationContext, startup: Startup, cli: Option<OpenTarget>, instance: Option<Primary>) -> Self {
         // Ctrl+= / Ctrl+- resize the thumbnails here, not the whole UI.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         install_symbol_font(&cc.egui_ctx);
         if let Some(instance) = &instance {
             instance.set_wake(wake(&cc.egui_ctx));
         }
+        let Startup { config, plans, active_window, icon, monitors, scale, root_placement } = startup;
+        let ctx = &cc.egui_ctx;
+        let mut windows = Windows::default();
+        let mut ids = Vec::new();
+        for (i, plan) in plans.iter().enumerate() {
+            let mut state = WindowState::default();
+            for folder in &plan.folders {
+                state.open_folder(ctx, &config, folder.clone());
+            }
+            state.activate(plan.active);
+            let id = if i == 0 {
+                *windows.state_mut(ROOT) = state;
+                if let Some(window) = windows.get_mut(ROOT) {
+                    window.placement = root_placement.map(Placement::new);
+                }
+                ROOT
+            } else {
+                let fitted = plan.bounds.map(|b| geometry::fit_to_monitors(b, &monitors, scale));
+                windows.add(state, fitted)
+            };
+            if let Some(window) = windows.get_mut(id) {
+                window.bounds = plan.bounds;
+            }
+            ids.push(id);
+        }
+        if let Some(&id) = ids.get(active_window) {
+            windows.touch(id);
+        }
         let config_path = Config::default_path();
         let mut app = Self {
-            config: Config::load(&config_path),
+            config,
             config_path,
             config_dirty: false,
             last_save: None,
-            thumbs: Thumbs::new(&cc.egui_ctx),
-            window: WindowState::default(),
-            title: String::new(),
+            thumbs: Thumbs::new(ctx),
+            windows,
+            cur: ROOT,
+            drag: None,
+            icon,
+            scale,
+            root_scale: scale,
+            closing: Vec::new(),
             open_requested: false,
             toast: None,
             pending_copy: None,
             instance,
+            published_target: 0,
         };
-        app.restore_session(&cc.egui_ctx);
         if let Some(target) = cli {
-            app.open_target(&cc.egui_ctx, target);
+            let dest = app.windows.last_active();
+            app.open_target(ctx, target, dest);
         }
         app
-    }
-
-    fn restore_session(&mut self, ctx: &Context) {
-        let stored = self.config.session.windows.first().cloned().unwrap_or_default();
-        let (folders, active) = restore_plan(&stored, Path::is_dir);
-        for folder in folders {
-            self.window.open_folder(ctx, &self.config, folder);
-        }
-        self.window.activate(active);
     }
 
     fn touch_config(&mut self) {
@@ -178,59 +313,264 @@ impl ImageMozApp {
     }
 
     fn sync_session(&mut self) {
-        let session = self.window.session();
-        if self.config.session.windows.first() != Some(&session) {
-            self.config.session.windows = vec![session];
+        let session = self.windows.session();
+        if self.config.session != session {
+            self.config.session = session;
             self.touch_config();
         }
     }
 
-    /// Opens the folder in a new tab, or shows the one that already has it.
-    fn open_target(&mut self, ctx: &Context, target: OpenTarget) {
-        let index = self.window.open_folder(ctx, &self.config, target.folder);
+    /// Opens the folder in a new tab of `dest`, or shows the one that already has it in any window.
+    /// Returns the window that now shows the folder.
+    fn open_target(&mut self, ctx: &Context, target: OpenTarget, dest: WindowId) -> WindowId {
+        let (window, index) = match self.windows.find_folder(&target.folder) {
+            Some((window, index)) => {
+                self.windows.state_mut(window).activate(index);
+                (window, index)
+            }
+            None => (dest, self.windows.state_mut(dest).open_folder(ctx, &self.config, target.folder)),
+        };
         if let Some(path) = target.select {
-            self.window.tabs[index].select_when_listed(path);
+            self.windows.state_mut(window).tabs[index].select_when_listed(path);
+        }
+        if window != dest {
+            self.raise(ctx, window);
         }
         ctx.request_repaint();
+        window
     }
 
     fn open_path(&mut self, ctx: &Context, path: &Path) {
         if let Some(target) = OpenTarget::from_path(path) {
-            self.open_target(ctx, target);
+            self.open_target(ctx, target, self.cur);
         }
     }
 
     fn close_tab(&mut self, ctx: &Context, index: usize) {
-        self.window.close(index);
-        if self.window.tabs.is_empty() {
-            self.thumbs.cancel_requests();
+        self.windows.state_mut(self.cur).close(index);
+        ctx.request_repaint();
+    }
+
+    /// Brings a window to the front, restoring it when minimized.
+    fn raise(&mut self, ctx: &Context, id: WindowId) {
+        self.windows.touch(id);
+        let Some(window) = self.windows.get(id) else { return };
+        match window.hwnd {
+            Some(hwnd) => platform::raise_window(hwnd),
+            None => {
+                let viewport = viewport_id(id);
+                ctx.send_viewport_cmd_to(viewport, ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd_to(viewport, ViewportCommand::Focus);
+            }
+        }
+    }
+
+    /// Opens what another launch forwarded in the window used last and brings it forward.
+    fn handle_forwarded(&mut self, ctx: &Context) {
+        let forwarded = self.instance.as_ref().map(Primary::try_iter).unwrap_or_default();
+        for path in forwarded {
+            log::debug!("forwarded from another launch: {path:?}");
+            let dest = self.windows.last_active();
+            let shown = match path.as_deref().and_then(OpenTarget::from_path) {
+                Some(target) => self.open_target(ctx, target, dest),
+                None => dest,
+            };
+            self.raise(ctx, shown);
+        }
+    }
+
+    /// Tells the pipe thread which window a forwarded launch should raise.
+    fn publish_target(&mut self) {
+        let last = self.windows.last_active();
+        let hwnd = self.windows.get(last).and_then(|w| w.hwnd).unwrap_or(0);
+        if hwnd != self.published_target {
+            self.published_target = hwnd;
+            if let Some(instance) = &self.instance {
+                instance.set_target_window(hwnd);
+            }
+        }
+    }
+
+    /// Collects scan results and watcher events of every tab of every window, then thumbnail results.
+    fn pump(&mut self, ctx: &Context) {
+        for tab in self.windows.iter_mut().flat_map(|w| w.state.tabs.iter_mut()) {
+            tab.pump(ctx, &mut self.thumbs);
+        }
+        let mut owners: Vec<_> = self
+            .windows
+            .iter_mut()
+            .flat_map(|w| w.state.tabs.iter_mut())
+            .map(|t| (&mut t.library, &mut t.gallery))
+            .collect();
+        self.thumbs.poll(ctx, &mut owners);
+    }
+
+    /// Reads what the viewport reports about its window. Returns where the drawing area sits on screen,
+    /// in physical pixels, and the pixels per point; `None` while minimized.
+    fn observe_window(&mut self, ctx: &Context, id: WindowId) -> Option<(Pos2, f32)> {
+        let info = ctx.input(|i| i.viewport().clone());
+        let scale = ctx.pixels_per_point();
+        if id == ROOT {
+            self.root_scale = scale;
+        }
+        if info.focused == Some(true) {
+            self.windows.touch(id);
+            if let Some(hwnd) = platform::foreground_own_window()
+                && let Some(window) = self.windows.get_mut(id)
+            {
+                window.hwnd = Some(hwnd);
+            }
+        }
+        if info.close_requested() && self.windows.len() > 1 {
+            // Only the last window may close the app: a root closed while others live is handed over.
+            if id == ROOT {
+                ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::CancelClose);
+            }
+            self.closing.push(id);
+        }
+        let (Some(outer), Some(inner)) = (info.outer_rect, info.inner_rect) else { return None };
+        if info.minimized == Some(true) {
+            return None;
+        }
+        let outer_px = px_rect(outer, scale);
+        let taken: Vec<isize> = self.windows.iter().filter(|w| w.id != id).filter_map(|w| w.hwnd).collect();
+        let window = self.windows.get_mut(id)?;
+        let actual = WindowBounds {
+            x: outer_px.left,
+            y: outer_px.top,
+            width: (inner.width() * scale).round().max(1.0) as u32,
+            height: (inner.height() * scale).round().max(1.0) as u32,
+        };
+        window.bounds = Some(actual);
+        let step = window.placement.as_mut().map(|p| (p.step(geometry::bounds_match(p.target, actual, 2)), p.target));
+        match step {
+            Some((Step::Wait, _)) => ctx.request_repaint_after(Duration::from_millis(150)),
+            Some((Step::Correct, target)) => {
+                log::debug!("placing window {id}: actual {actual:?} wanted {target:?} at scale {scale}");
+                let viewport = viewport_id(id);
+                let position = pos2(target.x as f32 / scale, target.y as f32 / scale);
+                let size = vec2(target.width as f32 / scale, target.height as f32 / scale);
+                ctx.send_viewport_cmd_to(viewport, ViewportCommand::OuterPosition(position));
+                ctx.send_viewport_cmd_to(viewport, ViewportCommand::InnerSize(size));
+                ctx.request_repaint_after(Duration::from_millis(150));
+            }
+            Some((Step::Done, _)) => window.placement = None,
+            None => {}
+        }
+        if window.hwnd.is_none() {
+            window.hwnd = platform::find_own_window(outer_px, &taken);
+        }
+        Some((pos2(inner.min.x * scale, inner.min.y * scale), scale))
+    }
+
+    fn drop_target(&self, cursor: Pos2) -> Option<DropTarget> {
+        let bars: Vec<(WindowId, BarGeometry)> =
+            self.windows.iter().filter_map(|w| Some((w.id, w.geometry.clone()?))).collect();
+        let top = platform::top_level_window_at(cursor.x as i32, cursor.y as i32);
+        // A bar covered by another window is not a target; a window with an unknown handle is given the benefit of the doubt.
+        let allowed = |id: WindowId| {
+            let hwnd = self.windows.get(id).and_then(|w| w.hwnd);
+            top.is_none_or(|t| hwnd.is_none_or(|h| h == t))
+        };
+        let (window, index) = geometry::drop_target(&bars, cursor, allowed)?;
+        Some(DropTarget { window, index })
+    }
+
+    /// Follows the cursor of a running tab drag and applies it when the button comes up.
+    fn update_drag(&mut self, ctx: &Context) {
+        let Some(mut drag) = self.drag.take() else { return };
+        log::trace!("drag frame");
+        if let Some((x, y)) = platform::cursor_pos() {
+            drag.cursor_px = pos2(x as f32, y as f32);
+        }
+        drag.target = self.drop_target(drag.cursor_px);
+        if platform::primary_button_down() {
+            // Nothing else wakes the other windows while the pointer is held in this one.
+            ctx.request_repaint();
+            self.drag = Some(drag);
+        } else {
+            self.finish_drag(ctx, &drag);
+        }
+    }
+
+    fn finish_drag(&mut self, ctx: &Context, drag: &TabDrag) {
+        log::debug!("tab drag released: tab {} target {:?}", drag.tab_id, drag.target);
+        let Some((source, _)) = self.windows.locate_tab(drag.tab_id) else { return };
+        match drag.target {
+            Some(target) if target.window == source => self.windows.reorder(drag.tab_id, target.index),
+            Some(target) => {
+                let changes = self.windows.move_tab(drag.tab_id, target.window, target.index);
+                self.apply_changes(ctx, changes);
+                if let Some((holder, _)) = self.windows.locate_tab(drag.tab_id) {
+                    self.raise(ctx, holder);
+                }
+            }
+            None => self.detach(drag, source),
         }
         ctx.request_repaint();
     }
 
-    /// Opens what another launch forwarded and brings the window forward.
-    fn handle_forwarded(&mut self, ctx: &Context) {
-        let Some(instance) = &self.instance else { return };
-        let forwarded = instance.try_iter();
-        for path in forwarded {
-            log::debug!("forwarded from another launch: {path:?}");
-            if let Some(path) = path {
-                self.open_path(ctx, &path);
+    /// Opens the dragged tab in a new window under the cursor, as large as the window it left.
+    fn detach(&mut self, drag: &TabDrag, source: WindowId) {
+        let from = self.windows.get(source);
+        let scale = from.and_then(|w| w.geometry.as_ref()).map_or(self.scale, |g| g.scale);
+        let default = ((DEFAULT_SIZE.0 * scale) as u32, (DEFAULT_SIZE.1 * scale) as u32);
+        let size = from.and_then(|w| w.bounds).map_or(default, |b| (b.width, b.height));
+        let wanted = geometry::detach_bounds((drag.cursor_px.x as i32, drag.cursor_px.y as i32), size, scale);
+        let fitted = geometry::fit_to_monitors(wanted, &platform::monitor_work_areas(), scale);
+        self.windows.detach(drag.tab_id, fitted);
+    }
+
+    /// Mirrors structural changes on the native windows. Closed viewports simply stop being shown.
+    fn apply_changes(&mut self, ctx: &Context, changes: Vec<Change>) {
+        for change in changes {
+            let Change::Promoted(bounds) = change else { continue };
+            if let Some(b) = bounds {
+                let scale = self.root_scale.max(0.5);
+                let position = pos2(b.x as f32 / scale, b.y as f32 / scale);
+                let size = vec2(b.width as f32 / scale, b.height as f32 / scale);
+                ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::OuterPosition(position));
+                ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::InnerSize(size));
             }
-            if ctx.input(|i| i.viewport().minimized) == Some(true) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.raise(ctx, ROOT);
         }
     }
 
-    /// Collects scan results and watcher events of every tab, then thumbnail results.
-    fn pump(&mut self, ctx: &Context) {
-        for tab in &mut self.window.tabs {
-            tab.pump(ctx, &mut self.thumbs);
+    fn begin_frame(&mut self, ctx: &Context) {
+        self.closing.clear();
+        for window in self.windows.iter_mut() {
+            window.geometry = None;
         }
-        let mut owners: Vec<_> = self.window.tabs.iter_mut().map(|t| (&mut t.library, &mut t.gallery)).collect();
-        self.thumbs.poll(ctx, &mut owners);
+        self.handle_forwarded(ctx);
+        self.pump(ctx);
+        self.poll_copy(ctx);
+        self.expire_toast(ctx);
+    }
+
+    fn end_frame(&mut self, ctx: &Context) {
+        self.update_drag(ctx);
+        let mut changes = Vec::new();
+        for id in std::mem::take(&mut self.closing) {
+            changes.extend(self.windows.close_window(id).unwrap_or_default());
+        }
+        changes.extend(self.windows.settle());
+        self.apply_changes(ctx, changes);
+        let visible: HashSet<u64> =
+            self.windows.iter().filter_map(|w| w.state.active_tab()).map(|t| t.gallery.id()).collect();
+        self.thumbs.retain_galleries(|id| visible.contains(&id));
+        self.publish_target();
+        self.sync_session();
+        self.flush_config(ctx);
+    }
+
+    fn expire_toast(&mut self, ctx: &Context) {
+        let Some(toast) = &self.toast else { return };
+        let age = toast.at.elapsed();
+        if age >= TOAST_DURATION && self.pending_copy.is_none() {
+            self.toast = None;
+        } else {
+            ctx.request_repaint_after(TOAST_DURATION.saturating_sub(age).max(Duration::from_millis(50)));
+        }
     }
 
     fn handle_input(&mut self, ctx: &Context) {
@@ -241,16 +581,16 @@ impl ImageMozApp {
 
         match ctx.input_mut(tab_shortcut) {
             Some(TabShortcut::New) => self.open_requested = true,
-            Some(TabShortcut::CloseActive) => self.close_tab(ctx, self.window.active),
+            Some(TabShortcut::CloseActive) => self.close_tab(ctx, self.windows.state(self.cur).active),
             Some(TabShortcut::Cycle(delta)) => {
-                self.window.cycle(delta);
+                self.windows.state_mut(self.cur).cycle(delta);
                 ctx.request_repaint();
             }
             None => {}
         }
 
         let typing = ctx.egui_wants_keyboard_input();
-        let browsing = self.window.active_tab().is_some_and(|t| t.preview.is_none());
+        let browsing = self.windows.state(self.cur).active_tab().is_some_and(|t| t.preview.is_none());
         let (layout, rescan, zoom) = ctx.input(|i| {
             let plain = !i.modifiers.any();
             let layout = if typing || !plain || !browsing {
@@ -298,14 +638,14 @@ impl ImageMozApp {
                 self.touch_config();
             }
         }
-        if rescan && let Some(tab) = self.window.active_tab_mut() {
+        if rescan && let Some(tab) = self.windows.state_mut(self.cur).active_tab_mut() {
             tab.refresh(&mut self.thumbs);
         }
         self.handle_gallery_keys(ctx);
     }
 
     fn handle_gallery_keys(&mut self, ctx: &Context) {
-        let Some(tab) = self.window.active_tab() else { return };
+        let Some(tab) = self.windows.state(self.cur).active_tab() else { return };
         if tab.preview.is_some() {
             self.handle_preview_keys(ctx);
             return;
@@ -345,7 +685,7 @@ impl ImageMozApp {
         });
         match action {
             Some(KeyAction::Move(dir, extend)) => {
-                if let Some(tab) = self.window.active_tab_mut() {
+                if let Some(tab) = self.windows.state_mut(self.cur).active_tab_mut() {
                     tab.move_focus(dir, extend);
                 }
             }
@@ -353,7 +693,7 @@ impl ImageMozApp {
             Some(KeyAction::CopyPaths) => self.copy_paths(ctx),
             Some(KeyAction::Pin) => self.toggle_focus_pin(),
             Some(KeyAction::Open) => {
-                if let Some(tab) = self.window.active_tab_mut() {
+                if let Some(tab) = self.windows.state_mut(self.cur).active_tab_mut() {
                     tab.open_preview(ctx);
                 }
             }
@@ -396,7 +736,7 @@ impl ImageMozApp {
             Some(PreviewAction::CopyFiles) => self.copy_files(ctx),
             Some(PreviewAction::CopyPaths) => self.copy_paths(ctx),
             Some(action) => {
-                let Some(tab) = self.window.active_tab_mut() else { return };
+                let Some(tab) = self.windows.state_mut(self.cur).active_tab_mut() else { return };
                 match action {
                     PreviewAction::Close => tab.preview = None,
                     PreviewAction::Step(delta) => tab.step_preview(ctx, delta),
@@ -413,7 +753,7 @@ impl ImageMozApp {
     }
 
     fn toggle_focus_pin(&mut self) {
-        let Some(tab) = self.window.active_tab() else { return };
+        let Some(tab) = self.windows.state(self.cur).active_tab() else { return };
         let Some(path) = tab.focus_id().map(|i| tab.gallery.order()[i].clone()) else { return };
         if tab.library.get(&path).is_some() && path.exists() {
             self.config.toggle_pin(&tab.root, &path);
@@ -421,13 +761,13 @@ impl ImageMozApp {
         }
     }
 
-    fn notify(&mut self, ctx: &Context, text: String) {
-        self.toast = Some((text, Instant::now()));
+    fn notify(&mut self, ctx: &Context, window: WindowId, text: String) {
+        self.toast = Some(Toast { window, text, at: Instant::now() });
         ctx.request_repaint_after(TOAST_DURATION);
     }
 
     fn copy_files(&mut self, ctx: &Context) {
-        let Some(tab) = self.window.active_tab() else { return };
+        let Some(tab) = self.windows.state(self.cur).active_tab() else { return };
         let files = tab.selected_paths();
         if files.is_empty() {
             return;
@@ -435,7 +775,7 @@ impl ImageMozApp {
         let focus = match &tab.preview {
             Some(preview) => {
                 if let Some(img) = preview.decoded_for(&preview.path) {
-                    self.finish_copy(ctx, files, Some((*img).clone()));
+                    self.finish_copy(ctx, self.cur, files, Some((*img).clone()));
                     return;
                 }
                 Some(preview.path.clone())
@@ -443,7 +783,7 @@ impl ImageMozApp {
             None => tab.focus_id().map(|i| tab.gallery.order()[i].clone()),
         };
         let Some(focus) = focus else {
-            self.finish_copy(ctx, files, None);
+            self.finish_copy(ctx, self.cur, files, None);
             return;
         };
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -452,8 +792,8 @@ impl ImageMozApp {
             let _ = tx.send(formats::decode(&focus));
             wake();
         });
-        self.pending_copy = Some(PendingCopy { files, decoded: rx });
-        self.notify(ctx, "Copie en cours…".to_string());
+        self.pending_copy = Some(PendingCopy { window: self.cur, files, decoded: rx });
+        self.notify(ctx, self.cur, "Copie en cours…".to_string());
     }
 
     fn poll_copy(&mut self, ctx: &Context) {
@@ -463,23 +803,23 @@ impl ImageMozApp {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => Err(DecodeError::Unsupported),
         };
-        let Some(PendingCopy { files, .. }) = self.pending_copy.take() else { return };
+        let Some(PendingCopy { window, files, .. }) = self.pending_copy.take() else { return };
         if let Err(e) = &result {
             log::warn!("cannot decode image for the clipboard: {e}");
         }
-        self.finish_copy(ctx, files, result.ok());
+        self.finish_copy(ctx, window, files, result.ok());
     }
 
-    fn finish_copy(&mut self, ctx: &Context, files: Vec<PathBuf>, bitmap: Option<RgbaImage>) {
+    fn finish_copy(&mut self, ctx: &Context, window: WindowId, files: Vec<PathBuf>, bitmap: Option<RgbaImage>) {
         let text = match platform::copy_files_and_bitmap(&files, bitmap.as_ref()) {
             Ok(()) => format!("Copié : {} fichier(s)", files.len()),
             Err(e) => format!("Copie impossible : {e}"),
         };
-        self.notify(ctx, text);
+        self.notify(ctx, window, text);
     }
 
     fn copy_paths(&mut self, ctx: &Context) {
-        let paths = self.window.active_tab().map(Tab::selected_paths).unwrap_or_default();
+        let paths = self.windows.state(self.cur).active_tab().map(Tab::selected_paths).unwrap_or_default();
         if paths.is_empty() {
             return;
         }
@@ -488,30 +828,22 @@ impl ImageMozApp {
             Ok(()) => "Chemins copiés".to_string(),
             Err(e) => format!("Copie impossible : {e}"),
         };
-        self.notify(ctx, message);
+        self.notify(ctx, self.cur, message);
     }
 
     fn pick_folder(&mut self, ctx: &Context) {
         let mut dialog = rfd::FileDialog::new();
-        if let Some(tab) = self.window.active_tab().filter(|t| t.root.is_dir()) {
+        if let Some(tab) = self.windows.state(self.cur).active_tab().filter(|t| t.root.is_dir()) {
             dialog = dialog.set_directory(&tab.root);
         }
         if let Some(folder) = dialog.pick_folder() {
-            self.open_target(ctx, OpenTarget { folder, select: None });
-        }
-    }
-
-    fn sync_title(&mut self, ctx: &Context) {
-        let title = window_title(self.window.active_tab().map(|t| t.root.as_path()));
-        if title != self.title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.title = title;
+            self.open_target(ctx, OpenTarget { folder, select: None }, self.cur);
         }
     }
 
     /// Applies toolbar edits of the folder settings to the active tab and the config.
     fn apply_folder_settings(&mut self, ctx: &Context, settings: FolderSettings) {
-        let Some(tab) = self.window.active_tab_mut() else { return };
+        let Some(tab) = self.windows.state_mut(self.cur).active_tab_mut() else { return };
         if settings.recursive != tab.recursive {
             tab.reopen(ctx, &mut self.thumbs, settings);
         }
@@ -522,7 +854,8 @@ impl ImageMozApp {
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
-        let Some(tab) = self.window.tabs.get_mut(self.window.active) else {
+        let win = self.windows.state_mut(self.cur);
+        let Some(tab) = win.tabs.get_mut(win.active) else {
             self.open_requested |= message(ui, "Aucun dossier ouvert", true);
             return;
         };
@@ -607,47 +940,75 @@ fn message(ui: &mut egui::Ui, text: &str, with_open: bool) -> bool {
     open
 }
 
-impl eframe::App for ImageMozApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl ImageMozApp {
+    fn sync_title(&mut self, ctx: &Context, id: WindowId) {
+        let title = window_title(self.windows.state(id).active_tab().map(|t| t.root.as_path()));
+        let Some(window) = self.windows.get_mut(id) else { return };
+        // Other windows get their title through their viewport builder.
+        if id == ROOT && window.title != title {
+            ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
+        }
+        window.title = title;
+    }
+
+    fn start_drag(&mut self, id: WindowId, index: usize) {
+        if let Some(tab) = self.windows.state(id).tabs.get(index) {
+            self.drag = Some(TabDrag { tab_id: tab.id, label: tab.label(), cursor_px: Pos2::ZERO, target: None });
+        }
+    }
+
+    /// A label that follows the cursor, drawn by whichever window the cursor is over.
+    fn paint_drag_ghost(&self, ctx: &Context, screen: Option<(Pos2, f32)>) {
+        let (Some(drag), Some((origin, scale))) = (&self.drag, screen) else { return };
+        let at = geometry::to_local(drag.cursor_px, origin, scale);
+        if !ctx.viewport_rect().contains(at) {
+            return;
+        }
+        let layer = egui::LayerId::new(egui::Order::Tooltip, Id::new("tab_drag_ghost"));
+        let painter = ctx.layer_painter(layer);
+        let galley = painter.layout_no_wrap(drag.label.clone(), egui::FontId::proportional(13.0), Color32::WHITE);
+        let rect = Rect::from_min_size(at + vec2(14.0, 14.0), galley.size() + vec2(16.0, 8.0));
+        painter.rect_filled(rect, CornerRadius::same(4), Color32::from_black_alpha(210));
+        painter.galley(rect.min + vec2(8.0, 4.0), galley, Color32::WHITE);
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+
+    /// The whole UI of one window: tab bar, toolbar, gallery or preview, status bar.
+    fn show_window(&mut self, ui: &mut egui::Ui, id: WindowId) {
+        self.cur = id;
         let ctx = ui.ctx().clone();
-        self.handle_forwarded(&ctx);
+        let screen = self.observe_window(&ctx, id);
         self.handle_input(&ctx);
-        self.pump(&ctx);
-        self.poll_copy(&ctx);
-        self.sync_title(&ctx);
-        if let Some(tab) = self.window.active_tab_mut() {
+        self.sync_title(&ctx, id);
+        if let Some(tab) = self.windows.state_mut(id).active_tab_mut() {
             tab.sync_preview();
         }
 
-        let tab_events = if self.window.tabs.is_empty() {
-            TabBarEvents::default()
-        } else {
-            egui::Panel::top("tabs")
-                .show(ui, |ui| tabbar::show(ui, &self.window.tabs, self.window.active))
-                .inner
+        let drag_view = DragView {
+            dragged: self.drag.as_ref().map(|d| d.tab_id),
+            marker: self.drag.as_ref().and_then(|d| d.target).filter(|t| t.window == id).map(|t| t.index),
         };
-        let previewing = self.window.active_tab().is_some_and(|t| t.preview.is_some());
-        let mut settings = self
-            .window
+        let win = self.windows.state(id);
+        let (tab_events, bar_rect) = if win.tabs.is_empty() {
+            (TabBarEvents::default(), None)
+        } else {
+            let bar = egui::Panel::top(Id::new(("tabs", id)))
+                .show(ui, |ui| tabbar::show(ui, &win.tabs, win.active, drag_view));
+            (bar.inner, Some(bar.response.rect))
+        };
+        let previewing = win.active_tab().is_some_and(|t| t.preview.is_some());
+        let mut settings = win
             .active_tab()
             .map_or_else(FolderSettings::default, |t| FolderSettings { recursive: t.recursive, sort: t.sort });
-        let has_tab = self.window.active_tab().is_some();
+        let has_tab = win.active_tab().is_some();
         let events = if previewing {
             toolbar::ToolbarEvents::default()
         } else {
-            egui::Panel::top("toolbar")
+            egui::Panel::top(Id::new(("toolbar", id)))
                 .show(ui, |ui| toolbar::show(ui, &mut self.config, &mut settings, has_tab))
                 .inner
         };
-        if let Some((_, at)) = &self.toast {
-            let age = at.elapsed();
-            if age >= TOAST_DURATION && self.pending_copy.is_none() {
-                self.toast = None;
-            } else {
-                ctx.request_repaint_after(TOAST_DURATION.saturating_sub(age).max(Duration::from_millis(50)));
-            }
-        }
-        let tab = self.window.active_tab();
+        let tab = self.windows.state(id).active_tab();
         let entry = tab.and_then(|tab| {
             tab.preview
                 .as_ref()
@@ -662,11 +1023,12 @@ impl eframe::App for ImageMozApp {
             total: tab.map_or(0, |t| t.library.len()),
             selected: tab.map_or(0, |t| t.selection.len()),
             loading: tab.is_some_and(Tab::is_scanning),
-            message: self.toast.as_ref().map(|(t, _)| t.as_str()),
+            message: self.toast.as_ref().filter(|t| t.window == id).map(|t| t.text.as_str()),
         };
-        egui::Panel::bottom("status").show(ui, |ui| status::show(ui, &info));
+        egui::Panel::bottom(Id::new(("status", id))).show(ui, |ui| status::show(ui, &info));
         if previewing {
-            if let Some(tab) = self.window.tabs.get_mut(self.window.active) {
+            let win = self.windows.state_mut(id);
+            if let Some(tab) = win.tabs.get_mut(win.active) {
                 let thumb = tab.preview.as_ref().and_then(|p| tab.gallery.thumbnail(&mut self.thumbs, p.index));
                 let frame = Frame::NONE.fill(preview_view::BACKGROUND);
                 egui::CentralPanel::default().frame(frame).show(ui, |ui| {
@@ -689,8 +1051,11 @@ impl eframe::App for ImageMozApp {
             self.apply_folder_settings(&ctx, settings);
         }
         if let Some(index) = tab_events.activate {
-            self.window.activate(index);
+            self.windows.state_mut(id).activate(index);
             ctx.request_repaint();
+        }
+        if let Some(index) = tab_events.drag_started {
+            self.start_drag(id, index);
         }
         if let Some(index) = tab_events.close {
             self.close_tab(&ctx, index);
@@ -698,11 +1063,38 @@ impl eframe::App for ImageMozApp {
         if events.open || std::mem::take(&mut self.open_requested) {
             self.pick_folder(&ctx);
         }
-        self.sync_session();
-        self.flush_config(&ctx);
+        if let (Some(bar), Some((origin_px, scale))) = (bar_rect, screen)
+            && let Some(window) = self.windows.get_mut(id)
+        {
+            window.geometry = Some(BarGeometry { bar, tabs: tab_events.tab_rects, origin_px, scale });
+        }
+        self.paint_drag_ghost(&ctx, screen);
+    }
+
+    fn show_secondary(&mut self, ctx: &Context, id: WindowId) {
+        let Some(window) = self.windows.get(id) else { return };
+        let title = window_title(window.state.active_tab().map(|t| t.root.as_path()));
+        let builder = window_builder(title, window.initial, self.scale, self.icon.clone());
+        ctx.show_viewport_immediate(viewport_id(id), builder, |ui, _class| self.show_window(ui, id));
+    }
+}
+
+impl eframe::App for ImageMozApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.begin_frame(&ctx);
+        for id in self.windows.ids() {
+            if id == ROOT {
+                self.show_window(ui, ROOT);
+            } else {
+                self.show_secondary(&ctx, id);
+            }
+        }
+        self.end_frame(&ctx);
     }
 
     fn on_exit(&mut self) {
+        log::debug!("exiting with {} window(s)", self.windows.len());
         self.sync_session();
         if self.config_dirty {
             self.save_config();
@@ -766,6 +1158,16 @@ mod tests {
             assert_eq!(shortcut_for(key, false, true), None, "{key:?} without Ctrl");
         }
         assert_eq!(shortcut_for(Key::P, false, false), None);
+    }
+
+    #[test]
+    fn a_stored_window_opens_at_its_pixels_whatever_the_scale() {
+        let fitted = Fitted { position: Some((300, 150)), size: (1500, 900) };
+        let builder = window_builder("t".into(), Some(fitted), 1.5, None);
+        assert_eq!(builder.position, Some(pos2(200.0, 100.0)));
+        assert_eq!(builder.inner_size, Some(vec2(1000.0, 600.0)));
+        let default = window_builder("t".into(), None, 1.5, None);
+        assert_eq!((default.position, default.inner_size), (None, Some(vec2(1200.0, 800.0))));
     }
 
     #[test]

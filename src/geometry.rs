@@ -122,6 +122,15 @@ pub fn fit_to_monitors(saved: WindowBounds, work: &[PxRect], scale: f32) -> Fitt
     Fitted { position: Some((x, y)), size }
 }
 
+/// Whether two sets of bounds agree to within `tolerance` pixels.
+pub fn bounds_match(a: WindowBounds, b: WindowBounds, tolerance: i32) -> bool {
+    let close = |x: i64, y: i64| (x - y).abs() <= i64::from(tolerance);
+    close(a.x.into(), b.x.into())
+        && close(a.y.into(), b.y.into())
+        && close(a.width.into(), b.width.into())
+        && close(a.height.into(), b.height.into())
+}
+
 /// Bounds for a window detached with the cursor at `cursor_px`, keeping the source's inner size.
 pub fn detach_bounds(cursor_px: (i32, i32), inner_px: (u32, u32), scale: f32) -> WindowBounds {
     WindowBounds {
@@ -252,6 +261,14 @@ mod tests {
     fn unknown_monitors_trust_the_stored_bounds() {
         let fitted = fit_to_monitors(bounds(-40, 7, 900, 500), &[], 1.0);
         assert_eq!(fitted, Fitted { position: Some((-40, 7)), size: (900, 500) });
+    }
+
+    #[test]
+    fn bounds_match_within_a_tolerance() {
+        let a = bounds(100, 80, 1000, 650);
+        assert!(bounds_match(a, bounds(101, 79, 1002, 648), 2));
+        assert!(!bounds_match(a, bounds(100, 80, 1500, 650), 2));
+        assert!(!bounds_match(a, bounds(5120, 80, 1000, 650), 2));
     }
 
     #[test]
