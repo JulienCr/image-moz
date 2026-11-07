@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
@@ -130,14 +131,53 @@ pub struct Output {
     pub config_changed: bool,
 }
 
+static NEXT_GALLERY_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Decode pool, disk cache and GPU textures, shared by every tab's `Gallery`.
+///
+/// Each visible gallery keeps its own request lists; the pipeline gets them interleaved,
+/// so several windows can show a tab at once without one starving the other.
 pub struct Thumbs {
     pipeline: ThumbPipeline,
     textures: TextureCache,
     backlog: VecDeque<ThumbResult>,
+    wanted: Requests,
+    probes: Requests,
+    near_tiles: HashMap<u64, usize>,
+}
+
+/// Jobs requested by each gallery, by gallery id, in the order the galleries first asked.
+#[derive(Default)]
+struct Requests(Vec<(u64, Vec<ThumbJob>)>);
+
+impl Requests {
+    fn set(&mut self, owner: u64, jobs: Vec<ThumbJob>) {
+        match self.0.iter_mut().find(|(id, _)| *id == owner) {
+            Some((_, slot)) => *slot = jobs,
+            None => self.0.push((owner, jobs)),
+        }
+    }
+
+    /// Drops the lists of galleries `keep` rejects; true when any was dropped.
+    fn retain(&mut self, keep: &impl Fn(u64) -> bool) -> bool {
+        let before = self.0.len();
+        self.0.retain(|(id, _)| keep(*id));
+        self.0.len() != before
+    }
+
+    fn merged(&self) -> Vec<ThumbJob> {
+        interleave(self.0.iter().map(|(_, jobs)| jobs.as_slice()).collect())
+    }
+}
+
+/// First item of each list, then the second of each, and so on.
+fn interleave<T: Clone>(lists: Vec<&[T]>) -> Vec<T> {
+    let longest = lists.iter().map(|l| l.len()).max().unwrap_or(0);
+    (0..longest).flat_map(|i| lists.iter().filter_map(move |l| l.get(i).cloned())).collect()
 }
 
 pub struct Gallery {
+    id: u64,
     lib_version: u64,
     dims_version: u64,
     sections_key: Option<(u64, SortOrder, bool)>,
@@ -197,13 +237,47 @@ impl Thumbs {
             pipeline: ThumbPipeline::new(cache, wake),
             textures: TextureCache::default(),
             backlog: VecDeque::new(),
+            wanted: Requests::default(),
+            probes: Requests::default(),
+            near_tiles: HashMap::new(),
         }
     }
 
     /// Drops every queued request, e.g. when no tab is left to want them.
-    pub fn cancel_requests(&self) {
-        self.pipeline.set_wanted(Vec::new());
-        self.pipeline.set_probe(Vec::new());
+    pub fn cancel_requests(&mut self) {
+        self.retain_galleries(|_| false);
+    }
+
+    /// Forgets the requests of galleries that are no longer on screen.
+    pub fn retain_galleries(&mut self, keep: impl Fn(u64) -> bool) {
+        if self.wanted.retain(&keep) {
+            self.pipeline.set_wanted(self.wanted.merged());
+        }
+        if self.probes.retain(&keep) {
+            self.pipeline.set_probe(self.probes.merged());
+        }
+        self.near_tiles.retain(|id, _| keep(*id));
+        self.fit_cap();
+    }
+
+    fn set_wanted(&mut self, owner: u64, jobs: Vec<ThumbJob>) {
+        self.wanted.set(owner, jobs);
+        self.pipeline.set_wanted(self.wanted.merged());
+    }
+
+    fn set_probe(&mut self, owner: u64, jobs: Vec<ThumbJob>) {
+        self.probes.set(owner, jobs);
+        self.pipeline.set_probe(self.probes.merged());
+    }
+
+    /// Every visible gallery keeps its near zone cached, so the cap is the sum over galleries.
+    fn note_near_tiles(&mut self, owner: u64, count: usize) {
+        self.near_tiles.insert(owner, count);
+        self.fit_cap();
+    }
+
+    fn fit_cap(&mut self) {
+        self.textures.fit_cap(self.near_tiles.values().sum());
     }
 
     /// Applies finished jobs to every tab that lists the file; texture uploads are spread over frames.
@@ -268,6 +342,7 @@ impl Default for Gallery {
 impl Gallery {
     pub fn new() -> Self {
         Self {
+            id: NEXT_GALLERY_ID.fetch_add(1, Ordering::Relaxed),
             lib_version: 0,
             dims_version: 0,
             sections_key: None,
@@ -286,6 +361,11 @@ impl Gallery {
             reset_scroll: false,
             order_version: 0,
         }
+    }
+
+    /// Names this gallery's requests in the shared `Thumbs`; stable for the tab's life.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn layout(&self) -> &Layout {
@@ -321,8 +401,8 @@ impl Gallery {
 
     /// The folder is re-read: rebuild from scratch. Textures stay, they are keyed by file state.
     pub fn reset(&mut self, thumbs: &mut Thumbs) {
-        thumbs.pipeline.set_wanted(Vec::new());
-        thumbs.pipeline.set_probe(Vec::new());
+        thumbs.set_wanted(self.id, Vec::new());
+        thumbs.set_probe(self.id, Vec::new());
         thumbs.pipeline.forget_all();
         self.last_wanted = None;
         self.sections_key = None;
@@ -452,7 +532,7 @@ impl Gallery {
         self.order_version += 1;
     }
 
-    fn update_probes(&mut self, thumbs: &Thumbs, library: &Library) {
+    fn update_probes(&mut self, thumbs: &mut Thumbs, library: &Library) {
         let mut jobs = Vec::new();
         for path in self.sections.iter().flat_map(|s| &s.items) {
             if let Some(e) = library.get(path)
@@ -462,7 +542,7 @@ impl Gallery {
                 jobs.push(ThumbJob { path: path.clone(), key: key_for(path, e.mtime, e.size) });
             }
         }
-        thumbs.pipeline.set_probe(jobs);
+        thumbs.set_probe(self.id, jobs);
         self.probe_dirty = false;
     }
 
@@ -493,7 +573,7 @@ impl Gallery {
         }
 
         let mut area = ScrollArea::vertical()
-            .id_salt("gallery_scroll")
+            .id_salt(("gallery_scroll", self.id))
             .auto_shrink([false, false])
             .content_margin(Margin::ZERO);
         if let Some(offset) = forced_offset {
@@ -689,15 +769,15 @@ impl Gallery {
         }
         far_jobs.sort_by(|a, b| a.0.total_cmp(&b.0));
         near_jobs.extend(far_jobs.into_iter().map(|(_, job)| job));
-        view.thumbs.textures.fit_cap(near_tiles);
+        view.thumbs.note_near_tiles(self.id, near_tiles);
         self.request_thumbs(view.thumbs, near_jobs);
     }
 
-    fn request_thumbs(&mut self, thumbs: &Thumbs, jobs: Vec<ThumbJob>) {
+    fn request_thumbs(&mut self, thumbs: &mut Thumbs, jobs: Vec<ThumbJob>) {
         let keys: Vec<ThumbKey> = jobs.iter().map(|j| j.key).collect();
         if self.last_wanted.as_ref() != Some(&keys) {
             self.last_wanted = Some(keys);
-            thumbs.pipeline.set_wanted(jobs);
+            thumbs.set_wanted(self.id, jobs);
         }
     }
 }
@@ -744,6 +824,65 @@ mod tests {
         assert!(!cache.contains(ThumbKey(1)));
     }
 
+    fn job(n: u64) -> ThumbJob {
+        ThumbJob { path: PathBuf::from(format!("{n}.png")), key: ThumbKey(n) }
+    }
+
+    fn keys(jobs: &[ThumbJob]) -> Vec<u64> {
+        jobs.iter().map(|j| j.key.0).collect()
+    }
+
+    #[test]
+    fn galleries_are_served_in_turn() {
+        assert_eq!(interleave(vec![&[1, 2, 3][..], &[10][..], &[][..], &[20, 21][..]]), [1, 10, 20, 2, 21, 3]);
+        assert_eq!(interleave::<u8>(Vec::new()), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn each_gallery_keeps_its_own_requests_until_it_is_hidden() {
+        let mut requests = Requests::default();
+        requests.set(1, vec![job(1), job(2)]);
+        requests.set(2, vec![job(10)]);
+        assert_eq!(keys(&requests.merged()), [1, 10, 2]);
+        requests.set(1, vec![job(3)]);
+        assert_eq!(keys(&requests.merged()), [3, 10]);
+        assert!(!requests.retain(&|_| true));
+        assert!(requests.retain(&|id| id == 2));
+        assert_eq!(keys(&requests.merged()), [10]);
+    }
+
+    #[test]
+    fn texture_cap_covers_every_visible_gallery() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_ctx, mut thumbs, _gallery) = test_thumbs(dir.path());
+        thumbs.note_near_tiles(1, 500);
+        thumbs.note_near_tiles(2, 600);
+        assert_eq!(thumbs.textures.cap, 1100 + TEXTURE_SLACK);
+        thumbs.note_near_tiles(2, 100);
+        assert_eq!(thumbs.textures.cap, 600 + TEXTURE_SLACK);
+        thumbs.retain_galleries(|id| id == 2);
+        assert_eq!(thumbs.textures.cap, MIN_TEXTURES);
+    }
+
+    #[test]
+    fn two_visible_galleries_both_get_their_thumbnails() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (img_a, img_b) = (dir_a.path().join("a.png"), dir_b.path().join("b.png"));
+        write_image(&img_a);
+        write_image(&img_b);
+        let (ctx, mut thumbs, mut gallery_a) = test_thumbs(dir_a.path());
+        let mut gallery_b = Gallery::new();
+        let (mut lib_a, mut lib_b) = (library_of(dir_a.path()), library_of(dir_b.path()));
+        probe(&mut thumbs, &mut gallery_a, &lib_a);
+        probe(&mut thumbs, &mut gallery_b, &lib_b);
+        let start = Instant::now();
+        while lib_a.get(&img_a).unwrap().dims.is_none() || lib_b.get(&img_b).unwrap().dims.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5), "a gallery was starved");
+            thumbs.poll(&ctx, &mut [(&mut lib_a, &mut gallery_a), (&mut lib_b, &mut gallery_b)]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn cap_follows_near_zone_tile_count() {
         let mut cache = TextureCache::default();
@@ -785,7 +924,7 @@ mod tests {
         library
     }
 
-    fn probe(thumbs: &Thumbs, gallery: &mut Gallery, library: &Library) {
+    fn probe(thumbs: &mut Thumbs, gallery: &mut Gallery, library: &Library) {
         gallery.sections = library.sections(SortOrder::default());
         gallery.library_changed();
         gallery.update_probes(thumbs, library);
@@ -826,14 +965,14 @@ mod tests {
         write_image(&img);
         let (ctx, mut thumbs, mut gallery) = test_thumbs(dir.path());
         let mut library = library_of(dir.path());
-        probe(&thumbs, &mut gallery, &library);
+        probe(&mut thumbs, &mut gallery, &library);
         assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
 
         let now = Instant::now();
         gallery.apply_change(&mut thumbs, &mut library, &FsChange::Remove(img.clone()), now);
         gallery.apply_change(&mut thumbs, &mut library, &FsChange::Upsert(img.clone()), now);
         assert_eq!(library.get(&img).unwrap().dims, None);
-        probe(&thumbs, &mut gallery, &library);
+        probe(&mut thumbs, &mut gallery, &library);
         assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
     }
 
@@ -844,12 +983,12 @@ mod tests {
         write_image(&img);
         let (ctx, mut thumbs, mut gallery) = test_thumbs(dir.path());
         let mut library = library_of(dir.path());
-        probe(&thumbs, &mut gallery, &library);
+        probe(&mut thumbs, &mut gallery, &library);
         assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
 
         gallery.replace_entries(&mut thumbs, &mut library, Vec::new());
         gallery.replace_entries(&mut thumbs, &mut library, crate::library::scan(dir.path(), false).unwrap());
-        probe(&thumbs, &mut gallery, &library);
+        probe(&mut thumbs, &mut gallery, &library);
         assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
     }
 
@@ -860,7 +999,7 @@ mod tests {
         write_image(&img);
         let (ctx, mut thumbs, mut gallery) = test_thumbs(dir.path());
         let mut library = library_of(dir.path());
-        probe(&thumbs, &mut gallery, &library);
+        probe(&mut thumbs, &mut gallery, &library);
         while thumbs.backlog.is_empty() {
             thumbs.backlog.extend(thumbs.pipeline.try_iter());
             std::thread::sleep(Duration::from_millis(10));
@@ -869,7 +1008,7 @@ mod tests {
         library.apply(&FsChange::Remove(img.clone()), Instant::now());
         thumbs.poll(&ctx, &mut [(&mut library, &mut gallery)]);
         library.apply(&FsChange::Upsert(img.clone()), Instant::now());
-        probe(&thumbs, &mut gallery, &library);
+        probe(&mut thumbs, &mut gallery, &library);
         assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
     }
 
@@ -880,12 +1019,12 @@ mod tests {
         std::fs::write(&bad, b"not an image").unwrap();
         let (ctx, mut thumbs, mut gallery) = test_thumbs(dir.path());
         let mut library = library_of(dir.path());
-        probe(&thumbs, &mut gallery, &library);
+        probe(&mut thumbs, &mut gallery, &library);
         assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &bad, |e| e.error));
 
         gallery.retry_failed(&mut thumbs, &mut library);
         assert!(!library.get(&bad).unwrap().error);
-        probe(&thumbs, &mut gallery, &library);
+        probe(&mut thumbs, &mut gallery, &library);
         assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &bad, |e| e.error));
     }
 
@@ -897,7 +1036,7 @@ mod tests {
         let (ctx, mut thumbs, mut gallery_a) = test_thumbs(dir_a.path());
         let (mut lib_a, mut lib_b) = (library_of(dir_a.path()), library_of(dir_b.path()));
         let mut gallery_b = Gallery::new();
-        probe(&thumbs, &mut gallery_a, &lib_a);
+        probe(&mut thumbs, &mut gallery_a, &lib_a);
 
         let start = Instant::now();
         while lib_a.get(&img).unwrap().dims.is_none() {
@@ -916,7 +1055,7 @@ mod tests {
         let (ctx, mut thumbs, mut gallery_a) = test_thumbs(dir_a.path());
         let (mut lib_a, mut lib_b) = (library_of(dir_a.path()), library_of(dir_b.path()));
         let mut gallery_b = Gallery::new();
-        probe(&thumbs, &mut gallery_a, &lib_a);
+        probe(&mut thumbs, &mut gallery_a, &lib_a);
         while thumbs.backlog.is_empty() {
             thumbs.backlog.extend(thumbs.pipeline.try_iter());
             std::thread::sleep(Duration::from_millis(10));
@@ -925,7 +1064,7 @@ mod tests {
         thumbs.poll(&ctx, &mut [(&mut lib_b, &mut gallery_b)]);
         assert!(thumbs.backlog.is_empty());
         assert_eq!(lib_a.get(&img).unwrap().dims, None);
-        probe(&thumbs, &mut gallery_a, &lib_a);
+        probe(&mut thumbs, &mut gallery_a, &lib_a);
         assert!(settles(&ctx, &mut thumbs, &mut gallery_a, &mut lib_a, &img, has_dims));
     }
 

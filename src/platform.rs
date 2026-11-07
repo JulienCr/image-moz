@@ -5,8 +5,10 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM};
-use windows::Win32::Graphics::Gdi::{BI_BITFIELDS, BITMAPV5HEADER};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Graphics::Gdi::{
+    BI_BITFIELDS, BITMAPV5HEADER, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     RegisterClipboardFormatW, SetClipboardData,
@@ -14,12 +16,17 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
 };
+use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows::Win32::UI::Shell::{DROPFILES, DragQueryFileW, HDROP, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOWNORMAL,
-    SetForegroundWindow, ShowWindowAsync,
+    EnumWindows, GA_ROOT, GW_OWNER, GetAncestor, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindow,
+    GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SM_SWAPBUTTON, SW_RESTORE, SW_SHOWNORMAL,
+    SetForegroundWindow, ShowWindowAsync, WindowFromPoint,
 };
 use windows::core::{BOOL, PCWSTR, w};
+
+use crate::geometry::PxRect;
 
 const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
@@ -255,31 +262,131 @@ pub fn reveal_in_explorer(path: &Path) {
     }
 }
 
-unsafe extern "system" fn first_own_window(hwnd: HWND, found: LPARAM) -> BOOL {
-    let found = found.0 as *mut Option<HWND>;
+unsafe extern "system" fn collect_own_window(hwnd: HWND, list: LPARAM) -> BOOL {
+    let list = unsafe { &mut *(list.0 as *mut Vec<HWND>) };
     let mut owner = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) };
     let top_level = unsafe { GetWindow(hwnd, GW_OWNER) }.map_or(true, |owner| owner.0.is_null());
     if owner == std::process::id() && top_level && unsafe { IsWindowVisible(hwnd) }.as_bool() {
-        unsafe { *found = Some(hwnd) };
-        return BOOL(0);
+        list.push(hwnd);
     }
     BOOL(1)
 }
 
-/// Restores and raises this process's main window from a non-UI thread.
+/// Visible top-level windows of this process, in z-order (topmost first).
+fn own_windows() -> Vec<HWND> {
+    let mut found: Vec<HWND> = Vec::new();
+    let _ = unsafe { EnumWindows(Some(collect_own_window), LPARAM(&mut found as *mut _ as isize)) };
+    found
+}
+
+fn to_handle(hwnd: isize) -> HWND {
+    HWND(hwnd as *mut std::ffi::c_void)
+}
+
+fn from_handle(hwnd: HWND) -> isize {
+    hwnd.0 as isize
+}
+
+/// Restores and raises a window; safe from any thread.
 ///
-/// A minimized egui window runs no frames, so the UI thread cannot do this itself.
-pub fn raise_own_window() {
-    let mut found: Option<HWND> = None;
-    let _ = unsafe { EnumWindows(Some(first_own_window), LPARAM(&mut found as *mut _ as isize)) };
-    let Some(hwnd) = found else { return };
+/// A minimized egui window runs no frames, so the UI thread cannot always do this itself.
+pub fn raise_window(hwnd: isize) {
+    let hwnd = to_handle(hwnd);
     unsafe {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindowAsync(hwnd, SW_RESTORE);
         }
         let _ = SetForegroundWindow(hwnd);
     }
+}
+
+/// Raises the first visible window of this process; for when no window has been identified yet.
+pub fn raise_any_own_window() {
+    if let Some(&hwnd) = own_windows().first() {
+        raise_window(from_handle(hwnd));
+    }
+}
+
+/// The window of this process that has the keyboard focus, if any.
+pub fn foreground_own_window() -> Option<isize> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    let mut owner = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) };
+    (owner == std::process::id() && !hwnd.0.is_null()).then(|| from_handle(hwnd))
+}
+
+/// The window of this process whose outer rectangle is `rect` (physical pixels, within 2 px).
+pub fn find_own_window(rect: PxRect) -> Option<isize> {
+    own_windows().into_iter().find(|&hwnd| {
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut r) }.is_ok()
+            && [r.left - rect.left, r.top - rect.top, r.right - rect.right, r.bottom - rect.bottom]
+                .iter()
+                .all(|d| d.abs() <= 2)
+    }).map(from_handle)
+}
+
+/// The top-level window under a screen point, of any process.
+pub fn top_level_window_at(x: i32, y: i32) -> Option<isize> {
+    let hwnd = unsafe { WindowFromPoint(POINT { x, y }) };
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    Some(from_handle(if root.0.is_null() { hwnd } else { root }))
+}
+
+/// Cursor position in screen pixels, which are physical once the process is DPI aware.
+pub fn cursor_pos() -> Option<(i32, i32)> {
+    let mut p = POINT::default();
+    unsafe { GetCursorPos(&mut p) }.ok().map(|()| (p.x, p.y))
+}
+
+/// Whether the main mouse button is held, whichever window has the capture.
+pub fn primary_button_down() -> bool {
+    let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
+    let key = if swapped { VK_RBUTTON } else { VK_LBUTTON };
+    // The high bit of the result is the "currently down" flag.
+    let state = unsafe { GetAsyncKeyState(i32::from(key.0)) };
+    state < 0
+}
+
+/// Opts the process into per-monitor DPI before any window exists; winit does the same later.
+pub fn enable_dpi_awareness() {
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
+/// Pixels per point a freshly created window starts with.
+pub fn system_scale() -> f32 {
+    (unsafe { GetDpiForSystem() }.max(96)) as f32 / 96.0
+}
+
+unsafe extern "system" fn collect_monitor(monitor: HMONITOR, _dc: HDC, _rect: *mut RECT, list: LPARAM) -> BOOL {
+    let list = unsafe { &mut *(list.0 as *mut Vec<PxRect>) };
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        let work = PxRect {
+            left: info.rcWork.left,
+            top: info.rcWork.top,
+            right: info.rcWork.right,
+            bottom: info.rcWork.bottom,
+        };
+        // MONITORINFOF_PRIMARY: the primary monitor goes first.
+        if info.dwFlags & 1 != 0 {
+            list.insert(0, work);
+        } else {
+            list.push(work);
+        }
+    }
+    BOOL(1)
+}
+
+/// Work areas of the connected monitors in screen pixels, the primary one first.
+pub fn monitor_work_areas() -> Vec<PxRect> {
+    let mut found: Vec<PxRect> = Vec::new();
+    let _ = unsafe { EnumDisplayMonitors(None, None, Some(collect_monitor), LPARAM(&mut found as *mut _ as isize)) };
+    found
 }
 
 #[cfg(test)]
