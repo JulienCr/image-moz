@@ -21,7 +21,11 @@ impl DiskCache {
         Ok(Self { dir })
     }
 
+    /// `IMAGE_MOZ_CACHE_DIR` replaces the default location; used by the end-to-end suite.
     pub fn default_dir() -> PathBuf {
+        if let Some(dir) = std::env::var_os("IMAGE_MOZ_CACHE_DIR").filter(|d| !d.is_empty()) {
+            return PathBuf::from(dir);
+        }
         directories::BaseDirs::new()
             .map(|d| d.data_local_dir().join("image-moz").join("thumbs"))
             .unwrap_or_else(|| std::env::temp_dir().join("image-moz").join("thumbs"))

@@ -6,6 +6,7 @@ use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -69,8 +70,10 @@ pub struct Names {
 }
 
 impl Names {
+    /// `IMAGE_MOZ_INSTANCE` scopes the names when set, so a test run never meets the user's instance.
     pub fn for_current_user() -> Self {
-        Self::new(&std::env::var("USERNAME").unwrap_or_default())
+        let scope = std::env::var("IMAGE_MOZ_INSTANCE").ok().filter(|s| !s.is_empty());
+        Self::new(&scope.unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_default()))
     }
 
     fn new(scope: &str) -> Self {
@@ -95,12 +98,19 @@ pub struct Primary {
     _mutex: OwnedHandle,
     incoming: Receiver<Forwarded>,
     wake: Arc<OnceLock<Wake>>,
+    /// HWND of the window a forwarded launch should raise; 0 until the UI names one.
+    target: Arc<AtomicIsize>,
 }
 
 impl Primary {
     /// Called once the UI exists: forwarded messages then repaint it.
     pub fn set_wake(&self, wake: Wake) {
         let _ = self.wake.set(wake);
+    }
+
+    /// Names the window a forwarded launch raises, from the thread that receives it.
+    pub fn set_target_window(&self, hwnd: isize) {
+        self.target.store(hwnd, Ordering::Relaxed);
     }
 
     pub fn try_iter(&self) -> Vec<Forwarded> {
@@ -137,14 +147,21 @@ pub fn acquire(names: &Names) -> io::Result<Acquired> {
     let first = create_pipe(&pipe_name, true)?;
     let (tx, incoming) = crossbeam_channel::unbounded();
     let wake: Arc<OnceLock<Wake>> = Arc::new(OnceLock::new());
-    let server_wake = wake.clone();
-    std::thread::Builder::new()
-        .name("instance-pipe".into())
-        .spawn(move || serve(first, &pipe_name, &tx, &server_wake))?;
-    Ok(Acquired::First(Primary { _mutex: mutex, incoming, wake }))
+    let target = Arc::new(AtomicIsize::new(0));
+    let server = Server { tx, wake: wake.clone(), target: target.clone() };
+    std::thread::Builder::new().name("instance-pipe".into()).spawn(move || serve(first, &pipe_name, &server))?;
+    Ok(Acquired::First(Primary { _mutex: mutex, incoming, wake, target }))
 }
 
-fn serve(first: OwnedHandle, name: &[u16], tx: &Sender<Forwarded>, wake: &Arc<OnceLock<Wake>>) {
+/// What the pipe threads share with the UI.
+#[derive(Clone)]
+struct Server {
+    tx: Sender<Forwarded>,
+    wake: Arc<OnceLock<Wake>>,
+    target: Arc<AtomicIsize>,
+}
+
+fn serve(first: OwnedHandle, name: &[u16], server: &Server) {
     let mut pipe = first;
     loop {
         // A client that connected and closed before we got here is reported as NO_DATA, but its bytes are still queued.
@@ -158,16 +175,15 @@ fn serve(first: OwnedHandle, name: &[u16], tx: &Sender<Forwarded>, wake: &Arc<On
             Err(e) => {
                 log::error!("cannot reopen the instance pipe: {e}");
                 if connected {
-                    handle_client(&ready, tx, wake);
+                    handle_client(&ready, server);
                 }
                 return;
             }
         };
         if connected {
-            let (tx, wake) = (tx.clone(), wake.clone());
-            let spawned = std::thread::Builder::new()
-                .name("instance-client".into())
-                .spawn(move || handle_client(&ready, &tx, &wake));
+            let server = server.clone();
+            let spawned =
+                std::thread::Builder::new().name("instance-client".into()).spawn(move || handle_client(&ready, &server));
             if let Err(e) = spawned {
                 log::warn!("cannot serve a forwarded launch: {e}");
             }
@@ -176,7 +192,7 @@ fn serve(first: OwnedHandle, name: &[u16], tx: &Sender<Forwarded>, wake: &Arc<On
 }
 
 /// Reads one message up to the client closing its end, and passes it on.
-fn handle_client(pipe: &OwnedHandle, tx: &Sender<Forwarded>, wake: &Arc<OnceLock<Wake>>) {
+fn handle_client(pipe: &OwnedHandle, server: &Server) {
     let mut message = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -198,9 +214,12 @@ fn handle_client(pipe: &OwnedHandle, tx: &Sender<Forwarded>, wake: &Arc<OnceLock
     let _ = unsafe { DisconnectNamedPipe(raw(pipe)) };
     match decode(&message) {
         Ok(forwarded) => {
-            if tx.send(forwarded).is_ok() {
-                crate::platform::raise_own_window();
-                if let Some(wake) = wake.get() {
+            if server.tx.send(forwarded).is_ok() {
+                match server.target.load(Ordering::Relaxed) {
+                    0 => crate::platform::raise_any_own_window(),
+                    hwnd => crate::platform::raise_window(hwnd),
+                }
+                if let Some(wake) = server.wake.get() {
                     wake();
                 }
             }

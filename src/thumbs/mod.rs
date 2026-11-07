@@ -42,6 +42,7 @@ pub struct Thumb {
     pub orig_dims: (u32, u32),
 }
 
+#[derive(Clone)]
 pub struct ThumbJob {
     pub path: PathBuf,
     pub key: ThumbKey,

@@ -2,3 +2,4 @@
 /.superpowers/
 /installer/Output/
 /.claude/worktrees/
+/tests/e2e/out/

@@ -3,12 +3,14 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui::{self, Context};
 
 use crate::config::{self, Config, FolderSettings, WindowSession};
+use crate::geometry;
 use crate::layout::{self, Dir};
 use crate::library::{self, Entry, FsChange, Library, SortOrder};
 use crate::preview::PreviewState;
@@ -17,6 +19,8 @@ use crate::ui::gallery::{Gallery, Thumbs};
 use crate::watcher::FolderWatcher;
 
 type ScanResult = io::Result<Vec<Entry>>;
+
+static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FolderIssue {
@@ -84,6 +88,8 @@ pub fn restore_plan(stored: &WindowSession, exists: impl Fn(&Path) -> bool) -> (
 }
 
 pub struct Tab {
+    /// Stable across moves between windows, unlike its index.
+    pub id: u64,
     pub root: PathBuf,
     /// What the library, watcher and scan were built with; changing it means `reopen`.
     pub recursive: bool,
@@ -117,6 +123,7 @@ impl Tab {
     pub fn open(ctx: &Context, root: PathBuf, settings: FolderSettings) -> Self {
         let (change_tx, changes) = crossbeam_channel::unbounded();
         let mut tab = Self {
+            id: NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed),
             library: Library::new(root.clone(), settings.recursive),
             root,
             recursive: settings.recursive,
@@ -476,15 +483,40 @@ impl WindowState {
     }
 
     pub fn close(&mut self, index: usize) {
+        self.remove_tab(index);
+    }
+
+    /// Takes the tab out without dropping it, keeping the active tab (or its neighbour) shown.
+    pub fn remove_tab(&mut self, index: usize) -> Option<Tab> {
         if index >= self.tabs.len() {
-            return;
+            return None;
         }
         let was_active = index == self.active;
-        self.tabs.remove(index);
+        let tab = self.tabs.remove(index);
         self.active = active_after_close(self.active, index, self.tabs.len());
         if was_active {
             self.activate(self.active);
         }
+        Some(tab)
+    }
+
+    /// Inserts `tab` before position `at` (clamped) and shows it. Returns its index.
+    pub fn insert_tab(&mut self, at: usize, tab: Tab) -> usize {
+        let at = at.min(self.tabs.len());
+        self.tabs.insert(at, tab);
+        self.activate(at);
+        at
+    }
+
+    /// Re-inserts tab `from` before `insertion` (an index in the list that still holds it) and shows it.
+    pub fn reorder(&mut self, from: usize, insertion: usize) {
+        if from >= self.tabs.len() {
+            return;
+        }
+        let to = geometry::reorder_target(from, insertion.min(self.tabs.len()));
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.activate(to);
     }
 
     /// Moves to the next (`+1`) or previous (`-1`) tab, wrapping around.
@@ -496,7 +528,7 @@ impl WindowState {
     }
 
     pub fn session(&self) -> WindowSession {
-        WindowSession { tabs: self.tabs.iter().map(|t| t.root.clone()).collect(), active: self.active }
+        WindowSession { tabs: self.tabs.iter().map(|t| t.root.clone()).collect(), active: self.active, bounds: None }
     }
 }
 
@@ -599,6 +631,7 @@ mod tests {
         let stored = WindowSession {
             tabs: ["a", "gone", "b", "A\\", "c"].map(PathBuf::from).to_vec(),
             active: 2,
+            ..Default::default()
         };
         let exists = |p: &Path| p.to_string_lossy() != "gone";
         let (tabs, active) = restore_plan(&stored, exists);
