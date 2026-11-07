@@ -48,3 +48,6 @@ opt-level = 3
 
 [profile.dev.package.image-webp]
 opt-level = 3
+
+[build-dependencies]
+winresource = "0.1.34"
