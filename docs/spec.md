@@ -22,8 +22,8 @@ Décisions issues d'un grilling en trois rounds (2026-10-29).
 
 - Trois façons de choisir le dossier : argument en ligne de commande
   (`image-moz.exe <dossier>`), glisser-déposer d'un dossier sur la fenêtre,
-  bouton « Ouvrir » (sélecteur natif).
-- Le dernier dossier ouvert est mémorisé et rouvert au lancement sans argument.
+  bouton « Ouvrir » (sélecteur natif). Chacune ouvre un onglet (§13).
+- La session (fenêtres et onglets) est mémorisée et restaurée au lancement (§13).
 - **Sous-dossiers** : un toggle « Récursif » dans la barre d'outils, désactivé
   par défaut.
   - En mode récursif, l'affichage est **découpé en sections**, une par dossier,
@@ -141,16 +141,106 @@ L'app est en **lecture seule** : aucune suppression, aucun renommage.
 
 ## 11. Configuration persistée
 
-Fichier de config (`%APPDATA%\image-moz\`) : dernier dossier, layout, taille,
-tri, toggle récursif, règle Bento, et par dossier : épingles et sections
-repliées.
+Fichier de config (`%APPDATA%\image-moz\`) : session (fenêtres, onglets,
+onglet actif, position et taille des fenêtres), layout, taille, règle Bento, et
+par dossier : épingles, sections repliées, toggle récursif et tri.
+
+L'ancien champ `last_folder` est lu une fois (migration) : il devient l'unique
+onglet de la session si aucune session n'est enregistrée.
 
 ## 12. Hors périmètre (v1)
 
 - Actions destructives (suppression, renommage, déplacement).
 - Réglage d'exposition HDR.
 - GIF animés (première frame seulement).
-- Remote git / distribution / installeur.
+- Remote git.
+- Entrée dans le menu contextuel principal de Windows 11 (`IExplorerCommand`
+  + paquet MSIX signé) : seule l'entrée classique est fournie.
+
+## 13. Onglets et fenêtres
+
+Décisions issues d'un grilling (2026-11-07).
+
+### Onglets
+
+- Chaque onglet affiche un dossier, avec sa propre bibliothèque, son watcher,
+  son scroll, sa sélection et son aperçu plein cadre.
+- Barre d'onglets au-dessus de la barre d'outils. Libellé : nom du dossier,
+  chemin complet au survol. Fermeture par `×` ou clic milieu.
+- `Ctrl+T` : sélecteur de dossier, résultat dans un nouvel onglet. `Ctrl+W` :
+  ferme l'onglet actif. `Ctrl+Tab` / `Ctrl+Shift+Tab` : onglet suivant /
+  précédent.
+- Bouton « Ouvrir », glisser-déposer d'un dossier et ligne de commande ouvrent
+  **un nouvel onglet**.
+- Un dossier déjà ouvert (comparaison via la clé de dossier, insensible à la
+  casse) **active l'onglet existant**, quelle que soit sa fenêtre, au lieu d'en
+  créer un second.
+- Ouvrir un **fichier image** (ligne de commande, menu contextuel) ouvre son
+  dossier parent et sélectionne cette image, en la faisant défiler à l'écran.
+- Fermer le dernier onglet de la dernière fenêtre laisse la fenêtre ouverte, vide.
+
+### Réglages
+
+- **Par dossier** (mémorisés dans la config) : toggle « Récursif » et tri,
+  en plus des épingles et des sections repliées. Un dossier jamais vu prend
+  les valeurs par défaut (non récursif, date ↓).
+- **Globaux** : layout, taille, règle Bento.
+
+### Onglets en arrière-plan
+
+- Ils restent surveillés : le watcher tourne, les changements sont appliqués à
+  leur bibliothèque.
+- L'onglet affiche un badge `(n)` du nombre d'images arrivées depuis sa
+  dernière activation ; le compteur repart à zéro quand on l'active.
+- Les miniatures ne sont demandées que pour l'onglet visible de chaque fenêtre.
+  Un seul pool de décodage et un seul cache disque servent tous les onglets.
+
+### Fenêtres multiples
+
+- Glisser un onglet hors de toute barre d'onglets et le relâcher le **détache**
+  dans une nouvelle fenêtre, ouverte sous le curseur.
+- Le relâcher sur la barre d'onglets d'une autre fenêtre l'y **déplace**, à la
+  position du curseur ; c'est ainsi qu'on fusionne deux fenêtres. Sur sa propre
+  barre, le glisser **réordonne** les onglets.
+- Une fenêtre dont le dernier onglet part se ferme. L'app se termine quand la
+  dernière fenêtre est fermée.
+- Toutes les fenêtres vivent dans le même processus.
+
+### Instance unique
+
+- Un seul processus Image Moz par session utilisateur. Un second lancement
+  transmet son argument au processus existant puis se termine.
+- Le chemin reçu s'ouvre dans un nouvel onglet de la **dernière fenêtre
+  active**, qui passe au premier plan.
+
+### Session
+
+- Au lancement sans argument, toutes les fenêtres et tous les onglets de la
+  dernière session sont restaurés, avec l'onglet actif, la position et la
+  taille de chaque fenêtre. Un dossier disparu entre-temps est ignoré.
+- Au lancement avec un argument, la session est restaurée puis le chemin
+  s'ouvre comme décrit plus haut.
+
+## 14. Distribution
+
+- **Nom affiché** : « Image Moz » (titre de fenêtre, menu Démarrer, installeur,
+  menu contextuel). L'exécutable reste `image-moz.exe`.
+- **Icône** : mosaïque Bento (une grande tuile, deux petites), lisible à 16 px.
+  Source SVG versionnée, `.ico` multi-tailles (16, 20, 24, 32, 40, 48, 64, 256)
+  intégré à l'exe et utilisé comme icône de fenêtre.
+- **Installeur** : Inno Setup 6, installation **pour toute la machine**
+  (`Program Files\Image Moz`, élévation UAC), raccourci dans le menu Démarrer,
+  désinstalleur. La désinstallation retire l'exe et les clés de registre, et
+  laisse la config et le cache de miniatures de chaque utilisateur.
+- **Menu contextuel** « Ouvrir dans Image Moz », entrée classique sous
+  `HKLM\Software\Classes` (visible sous « Afficher plus d'options » sur
+  Windows 11), avec l'icône de l'app :
+  - clic droit sur un dossier (`Directory\shell`) ;
+  - clic droit sur le fond d'un dossier ouvert (`Directory\Background\shell`,
+    argument `%V`) ;
+  - clic droit sur une image d'un format supporté
+    (`SystemFileAssociations\<ext>\shell`, une clé par extension) : sans
+    toucher à l'application par défaut des images.
 
 ## Annexe — briques envisagées (à valider à l'implémentation)
 
