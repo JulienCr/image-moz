@@ -1,6 +1,6 @@
 use eframe::egui::{ComboBox, Slider, Ui};
 
-use crate::config::{Config, MAX_SIZE, MIN_SIZE};
+use crate::config::{Config, FolderSettings, MAX_SIZE, MIN_SIZE};
 use crate::layout::{BentoRule, LayoutKind};
 use crate::library::SortOrder;
 
@@ -9,7 +9,7 @@ pub struct ToolbarEvents {
     pub open: bool,
     /// The recursive toggle flipped: the folder must be re-read and re-watched.
     pub recursive_changed: bool,
-    /// Any persisted setting changed.
+    /// A global setting changed.
     pub config_changed: bool,
 }
 
@@ -30,16 +30,18 @@ fn rule_label(rule: BentoRule) -> &'static str {
     }
 }
 
-pub fn show(ui: &mut Ui, config: &mut Config) -> ToolbarEvents {
+/// `folder` holds the active tab's settings; its controls are disabled when no tab is open.
+pub fn show(ui: &mut Ui, config: &mut Config, folder: &mut FolderSettings, has_tab: bool) -> ToolbarEvents {
     let mut events = ToolbarEvents::default();
     ui.horizontal_wrapped(|ui| {
         if ui.button("Ouvrir").clicked() {
             events.open = true;
         }
-        if ui.checkbox(&mut config.recursive, "Récursif").changed() {
-            events.recursive_changed = true;
-            events.config_changed = true;
-        }
+        ui.add_enabled_ui(has_tab, |ui| {
+            if ui.checkbox(&mut folder.recursive, "Récursif").changed() {
+                events.recursive_changed = true;
+            }
+        });
         ui.separator();
         for (kind, label, hint) in [
             (LayoutKind::Grid, "Grille", "Grille uniforme (1)"),
@@ -50,15 +52,16 @@ pub fn show(ui: &mut Ui, config: &mut Config) -> ToolbarEvents {
             events.config_changed |= response.changed();
         }
         ui.separator();
-        ComboBox::from_id_salt("sort_order")
-            .selected_text(sort_label(config.sort))
-            .width(90.0)
-            .show_ui(ui, |ui| {
-                for sort in [SortOrder::DateDesc, SortOrder::DateAsc, SortOrder::NameAsc, SortOrder::NameDesc] {
-                    events.config_changed |=
-                        ui.selectable_value(&mut config.sort, sort, sort_label(sort)).changed();
-                }
-            });
+        ui.add_enabled_ui(has_tab, |ui| {
+            ComboBox::from_id_salt("sort_order")
+                .selected_text(sort_label(folder.sort))
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for sort in [SortOrder::DateDesc, SortOrder::DateAsc, SortOrder::NameAsc, SortOrder::NameDesc] {
+                        ui.selectable_value(&mut folder.sort, sort, sort_label(sort));
+                    }
+                });
+        });
         if config.layout == LayoutKind::Bento {
             ComboBox::from_id_salt("bento_rule")
                 .selected_text(rule_label(config.bento_rule))

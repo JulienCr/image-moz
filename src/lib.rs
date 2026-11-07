@@ -1,11 +1,13 @@
 pub mod app;
 pub mod config;
 pub mod formats;
+pub mod instance;
 pub mod layout;
 pub mod library;
 pub mod platform;
 pub mod preview;
 pub mod selection;
+pub mod tab;
 pub mod thumbs;
 pub mod ui;
 pub mod watcher;

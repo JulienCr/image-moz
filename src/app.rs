@@ -1,31 +1,26 @@
-use std::collections::HashMap;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use eframe::egui::{self, Context, Frame, Key, Margin};
+use crossbeam_channel::{Receiver, TryRecvError};
+use eframe::egui::{self, Context, Frame, Key, Margin, Modifiers};
 use image::RgbaImage;
 
-use crate::config::{Config, MAX_SIZE, MIN_SIZE};
+use crate::config::{Config, FolderSettings, MAX_SIZE, MIN_SIZE};
 use crate::formats::{self, DecodeError};
-use crate::layout::{self, Dir, Layout, LayoutKind};
-use crate::library::{self, Entry, FsChange, Library};
+use crate::instance::Primary;
+use crate::layout::{Dir, LayoutKind};
 use crate::platform;
-use crate::preview::PreviewState;
-use crate::selection::Selection;
-use crate::ui::gallery::{self, Gallery};
+use crate::tab::{FolderIssue, OpenTarget, Tab, WindowState, absolute, restore_plan, wake};
+use crate::ui::gallery::{self, Thumbs};
 use crate::ui::preview_view;
 use crate::ui::status::{self, StatusInfo};
+use crate::ui::tabbar::{self, TabBarEvents};
 use crate::ui::toolbar;
-use crate::watcher::FolderWatcher;
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(1);
 const SIZE_STEP: f32 = 16.0;
 const TOAST_DURATION: Duration = Duration::from_secs(2);
-
-type ScanResult = io::Result<Vec<Entry>>;
+const APP_NAME: &str = "Image Moz";
 
 struct PendingCopy {
     files: Vec<PathBuf>,
@@ -48,19 +43,11 @@ enum PreviewAction {
     CopyPaths,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FolderIssue {
-    Missing,
-    Unreadable,
-}
-
-fn absolute(path: &Path) -> PathBuf {
-    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// The folder to browse for a path from the command line or a drop: a file opens its parent.
-pub fn folder_to_open(path: &Path) -> Option<PathBuf> {
-    if path.is_file() { path.parent().map(Path::to_path_buf) } else { Some(path.to_path_buf()) }
+#[derive(Debug, PartialEq, Eq)]
+enum TabShortcut {
+    New,
+    CloseActive,
+    Cycle(isize),
 }
 
 /// A key press that is not an OS auto-repeat.
@@ -71,33 +58,35 @@ fn fresh_press(input: &egui::InputState, key: Key) -> bool {
         .any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, .. } if *k == key))
 }
 
+fn tab_shortcut(i: &mut egui::InputState) -> Option<TabShortcut> {
+    let cmd = Modifiers::COMMAND;
+    let (fresh_t, fresh_w) = (fresh_press(i, Key::T), fresh_press(i, Key::W));
+    // consume_key ignores an extra Shift, so the Shift variant has to be tried first.
+    if i.consume_key(cmd | Modifiers::SHIFT, Key::Tab) {
+        Some(TabShortcut::Cycle(-1))
+    } else if i.consume_key(cmd, Key::Tab) {
+        Some(TabShortcut::Cycle(1))
+    } else if i.consume_key(cmd, Key::T) && fresh_t {
+        Some(TabShortcut::New)
+    } else if i.consume_key(cmd, Key::W) && fresh_w {
+        Some(TabShortcut::CloseActive)
+    } else {
+        None
+    }
+}
+
 pub struct ImageMozApp {
     config: Config,
     config_path: PathBuf,
     config_dirty: bool,
     last_save: Option<Instant>,
-    root: Option<PathBuf>,
-    library: Library,
-    watcher: Option<FolderWatcher>,
-    change_tx: Sender<FsChange>,
-    changes: Receiver<FsChange>,
-    scan: Option<Receiver<ScanResult>>,
-    scan_is_initial: bool,
-    rescan_wanted: bool,
-    /// Changes received while a scan runs; replayed on top of its result.
-    deferred: Vec<FsChange>,
-    folder_issue: Option<FolderIssue>,
-    gallery: Gallery,
-    pub selection: Selection,
-    hovered: Option<PathBuf>,
+    thumbs: Thumbs,
+    window: WindowState,
     title: String,
     open_requested: bool,
-    scroll_to: Option<usize>,
     toast: Option<(String, Instant)>,
     pending_copy: Option<PendingCopy>,
-    /// Order the selection positions refer to, with the gallery version it came from.
-    order_snapshot: (u64, Vec<PathBuf>),
-    preview: Option<PreviewState>,
+    instance: Option<Primary>,
 }
 
 /// The bundled fonts lack arrows (↓ ↑ →); Segoe UI Symbol covers them on Windows.
@@ -109,7 +98,7 @@ fn install_symbol_font(ctx: &Context) {
         return;
     };
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("symbols".into(), Arc::new(egui::FontData::from_owned(bytes)));
+    fonts.font_data.insert("symbols".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
     if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
         family.push("symbols".into());
     }
@@ -118,64 +107,47 @@ fn install_symbol_font(ctx: &Context) {
 
 fn window_title(root: Option<&Path>) -> String {
     match root {
-        Some(root) => format!("image-moz — {}", root.display()),
-        None => "image-moz".to_string(),
+        Some(root) => format!("{APP_NAME} — {}", root.display()),
+        None => APP_NAME.to_string(),
     }
 }
 
 impl ImageMozApp {
-    pub fn new(cc: &eframe::CreationContext, cli_folder: Option<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext, cli: Option<OpenTarget>, instance: Option<Primary>) -> Self {
         // Ctrl+= / Ctrl+- resize the thumbnails here, not the whole UI.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         install_symbol_font(&cc.egui_ctx);
+        if let Some(instance) = &instance {
+            instance.set_wake(wake(&cc.egui_ctx));
+        }
         let config_path = Config::default_path();
-        let config = Config::load(&config_path);
-        let folder = cli_folder.or_else(|| config.last_folder.clone());
-        let (change_tx, changes) = crossbeam_channel::unbounded();
         let mut app = Self {
-            library: Library::new(PathBuf::new(), config.recursive),
-            config,
+            config: Config::load(&config_path),
             config_path,
             config_dirty: false,
             last_save: None,
-            root: None,
-            watcher: None,
-            change_tx,
-            changes,
-            scan: None,
-            scan_is_initial: false,
-            rescan_wanted: false,
-            deferred: Vec::new(),
-            folder_issue: None,
-            gallery: Gallery::new(&cc.egui_ctx),
-            selection: Selection::default(),
-            hovered: None,
+            thumbs: Thumbs::new(&cc.egui_ctx),
+            window: WindowState::default(),
             title: String::new(),
             open_requested: false,
-            scroll_to: None,
             toast: None,
             pending_copy: None,
-            order_snapshot: (0, Vec::new()),
-            preview: None,
+            instance,
         };
-        if let Some(folder) = folder {
-            app.open_folder(&cc.egui_ctx, folder);
+        app.restore_session(&cc.egui_ctx);
+        if let Some(target) = cli {
+            app.open_target(&cc.egui_ctx, target);
         }
         app
     }
 
-    /// Tile paths in display order; selection positions index into this slice.
-    pub fn visible_order(&self) -> &[PathBuf] {
-        self.gallery.order()
-    }
-
-    pub fn layout(&self) -> &Layout {
-        self.gallery.layout()
-    }
-
-    fn wake(ctx: &Context) -> Arc<dyn Fn() + Send + Sync> {
-        let ctx = ctx.clone();
-        Arc::new(move || ctx.request_repaint())
+    fn restore_session(&mut self, ctx: &Context) {
+        let stored = self.config.session.windows.first().cloned().unwrap_or_default();
+        let (folders, active) = restore_plan(&stored, Path::is_dir);
+        for folder in folders {
+            self.window.open_folder(ctx, &self.config, folder);
+        }
+        self.window.activate(active);
     }
 
     fn touch_config(&mut self) {
@@ -205,152 +177,80 @@ impl ImageMozApp {
         }
     }
 
-    /// (Re)opens `folder` with the current recursive setting: new library, watcher and scan.
-    fn open_folder(&mut self, ctx: &Context, folder: PathBuf) {
-        let recursive = self.config.recursive;
-        self.library = Library::new(folder.clone(), recursive);
-        self.selection.clear();
-        self.order_snapshot.1.clear();
-        self.pending_copy = None;
-        self.preview = None;
-        self.hovered = None;
-        self.deferred.clear();
-        self.rescan_wanted = false;
-        self.folder_issue = None;
-        self.gallery.reset();
-
-        let (tx, rx) = crossbeam_channel::unbounded();
-        self.change_tx = tx;
-        self.changes = rx;
-        self.arm_watcher(ctx, &folder);
-        self.scan_is_initial = true;
-        self.start_scan(ctx, &folder);
-
-        if self.config.last_folder.as_deref() != Some(folder.as_path()) {
-            self.config.last_folder = Some(folder.clone());
+    fn sync_session(&mut self) {
+        let session = self.window.session();
+        if self.config.session.windows.first() != Some(&session) {
+            self.config.session.windows = vec![session];
             self.touch_config();
         }
-        self.root = Some(folder);
     }
 
-    /// (Re)starts the watcher on `folder`; false when the OS refuses (e.g. the folder is gone).
-    fn arm_watcher(&mut self, ctx: &Context, folder: &Path) -> bool {
-        self.watcher = None;
-        let (recursive, tx) = (self.config.recursive, self.change_tx.clone());
-        match FolderWatcher::start(folder, recursive, tx, Self::wake(ctx)) {
-            Ok(watcher) => {
-                self.watcher = Some(watcher);
-                true
-            }
-            Err(e) => {
-                log::warn!("cannot watch {}: {e}", folder.display());
-                false
-            }
+    /// Opens the folder in a new tab, or shows the one that already has it.
+    fn open_target(&mut self, ctx: &Context, target: OpenTarget) {
+        let index = self.window.open_folder(ctx, &self.config, target.folder);
+        if let Some(path) = target.select {
+            self.window.tabs[index].select_when_listed(path);
+        }
+        ctx.request_repaint();
+    }
+
+    fn open_path(&mut self, ctx: &Context, path: &Path) {
+        if let Some(target) = OpenTarget::from_path(path) {
+            self.open_target(ctx, target);
         }
     }
 
-    fn start_scan(&mut self, ctx: &Context, folder: &Path) {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let (folder, recursive, wake) = (folder.to_path_buf(), self.config.recursive, Self::wake(ctx));
-        std::thread::spawn(move || {
-            let _ = tx.send(library::scan(&folder, recursive));
-            wake();
-        });
-        self.scan = Some(rx);
+    fn close_tab(&mut self, ctx: &Context, index: usize) {
+        self.window.close(index);
+        if self.window.tabs.is_empty() {
+            self.thumbs.cancel_requests();
+        }
+        ctx.request_repaint();
     }
 
-    /// Swaps in a scan result, keeping dims, error and highlight of unchanged files.
-    fn apply_scan(&mut self, ctx: &Context, result: ScanResult) {
-        match result {
-            Err(e) => {
-                log::warn!("scan failed: {e}");
-                let missing = e.kind() == io::ErrorKind::NotFound;
-                if self.scan_is_initial || missing {
-                    self.gallery.replace_entries(&mut self.library, Vec::new());
-                    self.folder_issue = Some(if missing { FolderIssue::Missing } else { FolderIssue::Unreadable });
-                }
+    /// Opens what another launch forwarded and brings the window forward.
+    fn handle_forwarded(&mut self, ctx: &Context) {
+        let Some(instance) = &self.instance else { return };
+        let forwarded = instance.try_iter();
+        for path in forwarded {
+            log::debug!("forwarded from another launch: {path:?}");
+            if let Some(path) = path {
+                self.open_path(ctx, &path);
             }
-            Ok(mut entries) => {
-                // A watcher that never started, or died with its folder, is re-armed here.
-                let needs_watcher = self.watcher.is_none() || self.folder_issue.is_some();
-                self.folder_issue = None;
-                let now = Instant::now();
-                for entry in &mut entries {
-                    match self.library.get(&entry.path) {
-                        Some(old) if old.mtime == entry.mtime && old.size == entry.size => {
-                            entry.dims = old.dims;
-                            entry.error = old.error;
-                            entry.arrived_at = old.arrived_at;
-                        }
-                        Some(_) => {}
-                        None if !self.scan_is_initial => entry.arrived_at = Some(now),
-                        None => {}
-                    }
-                }
-                self.gallery.replace_entries(&mut self.library, entries);
-                if needs_watcher
-                    && let Some(root) = self.root.clone()
-                    && self.arm_watcher(ctx, &root)
-                {
-                    // Changes between the scan and the arming were not watched.
-                    self.rescan_wanted = true;
-                }
+            if ctx.input(|i| i.viewport().minimized) == Some(true) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
-        }
-        log::debug!("scan applied: {} entries", self.library.len());
-        self.scan_is_initial = false;
-        for change in std::mem::take(&mut self.deferred) {
-            self.apply_change(&change);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 
-    fn apply_change(&mut self, change: &FsChange) {
-        log::debug!("fs change: {change:?}");
-        self.gallery.apply_change(&mut self.library, change, Instant::now());
-    }
-
-    /// Collects scan results and watcher events; at most one scan runs at a time.
+    /// Collects scan results and watcher events of every tab, then thumbnail results.
     fn pump(&mut self, ctx: &Context) {
-        if let Some(scan) = &self.scan {
-            match scan.try_recv() {
-                Ok(result) => {
-                    self.scan = None;
-                    self.apply_scan(ctx, result);
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    log::error!("scan thread died without a result");
-                    self.scan = None;
-                }
-            }
+        for tab in &mut self.window.tabs {
+            tab.pump(ctx, &mut self.thumbs);
         }
-        let changes: Vec<FsChange> = self.changes.try_iter().collect();
-        for change in changes {
-            match change {
-                FsChange::Rescan => self.rescan_wanted = true,
-                change if self.scan.is_some() => self.deferred.push(change),
-                change => self.apply_change(&change),
-            }
-        }
-        if self.rescan_wanted
-            && self.scan.is_none()
-            && let Some(root) = self.root.clone()
-        {
-            self.rescan_wanted = false;
-            self.start_scan(ctx, &root);
-        }
+        let mut owners: Vec<_> = self.window.tabs.iter_mut().map(|t| (&mut t.library, &mut t.gallery)).collect();
+        self.thumbs.poll(ctx, &mut owners);
     }
 
     fn handle_input(&mut self, ctx: &Context) {
-        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = dropped
-            && let Some(folder) = folder_to_open(&path)
-        {
-            self.open_folder(ctx, folder);
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        for path in dropped {
+            self.open_path(ctx, &path);
+        }
+
+        match ctx.input_mut(tab_shortcut) {
+            Some(TabShortcut::New) => self.open_requested = true,
+            Some(TabShortcut::CloseActive) => self.close_tab(ctx, self.window.active),
+            Some(TabShortcut::Cycle(delta)) => {
+                self.window.cycle(delta);
+                ctx.request_repaint();
+            }
+            None => {}
         }
 
         let typing = ctx.egui_wants_keyboard_input();
-        let browsing = self.preview.is_none();
+        let browsing = self.window.active_tab().is_some_and(|t| t.preview.is_none());
         let (layout, rescan, zoom) = ctx.input(|i| {
             let plain = !i.modifiers.any();
             let layout = if typing || !plain || !browsing {
@@ -398,19 +298,19 @@ impl ImageMozApp {
                 self.touch_config();
             }
         }
-        if rescan {
-            self.rescan_wanted = true;
-            self.gallery.retry_failed(&mut self.library);
+        if rescan && let Some(tab) = self.window.active_tab_mut() {
+            tab.refresh(&mut self.thumbs);
         }
         self.handle_gallery_keys(ctx);
     }
 
     fn handle_gallery_keys(&mut self, ctx: &Context) {
-        if self.preview.is_some() {
+        let Some(tab) = self.window.active_tab() else { return };
+        if tab.preview.is_some() {
             self.handle_preview_keys(ctx);
             return;
         }
-        if ctx.egui_wants_keyboard_input() || self.library.is_empty() || self.gallery.order().is_empty() {
+        if ctx.egui_wants_keyboard_input() || tab.library.is_empty() || tab.gallery.order().is_empty() {
             return;
         }
         let action = ctx.input_mut(|i| {
@@ -444,34 +344,21 @@ impl ImageMozApp {
             (!m.shift && i.key_pressed(Key::P)).then_some(KeyAction::Pin)
         });
         match action {
-            Some(KeyAction::Move(dir, extend)) => self.move_focus(dir, extend),
+            Some(KeyAction::Move(dir, extend)) => {
+                if let Some(tab) = self.window.active_tab_mut() {
+                    tab.move_focus(dir, extend);
+                }
+            }
             Some(KeyAction::CopyFiles) => self.copy_files(ctx),
             Some(KeyAction::CopyPaths) => self.copy_paths(ctx),
             Some(KeyAction::Pin) => self.toggle_focus_pin(),
-            Some(KeyAction::Open) => self.open_preview(ctx),
+            Some(KeyAction::Open) => {
+                if let Some(tab) = self.window.active_tab_mut() {
+                    tab.open_preview(ctx);
+                }
+            }
             None => {}
         }
-    }
-
-    fn open_preview(&mut self, ctx: &Context) {
-        let Some(id) = self.focus_id() else { return };
-        self.show_preview(ctx, id);
-    }
-
-    /// Opens the preview on tile `id`, or retargets an open one.
-    fn show_preview(&mut self, ctx: &Context, id: usize) {
-        let Some(path) = self.gallery.order().get(id).cloned() else { return };
-        let hint = self
-            .library
-            .get(&path)
-            .and_then(|e| e.dims)
-            .map(|(w, h)| egui::vec2(w as f32, h as f32));
-        match &mut self.preview {
-            Some(preview) => preview.show(ctx, id, path, hint),
-            None => self.preview = Some(PreviewState::open(ctx, id, path, hint)),
-        }
-        self.selection.move_to(id, false);
-        self.scroll_to = Some(id);
     }
 
     fn handle_preview_keys(&mut self, ctx: &Context) {
@@ -506,82 +393,32 @@ impl ImageMozApp {
             }
         });
         match action {
-            Some(PreviewAction::Close) => self.preview = None,
-            Some(PreviewAction::Step(delta)) => self.step_preview(ctx, delta),
-            Some(PreviewAction::Refit) => {
-                if let Some(preview) = &mut self.preview {
-                    preview.fitted = true;
-                }
-            }
             Some(PreviewAction::CopyFiles) => self.copy_files(ctx),
             Some(PreviewAction::CopyPaths) => self.copy_paths(ctx),
+            Some(action) => {
+                let Some(tab) = self.window.active_tab_mut() else { return };
+                match action {
+                    PreviewAction::Close => tab.preview = None,
+                    PreviewAction::Step(delta) => tab.step_preview(ctx, delta),
+                    PreviewAction::Refit => {
+                        if let Some(preview) = &mut tab.preview {
+                            preview.fitted = true;
+                        }
+                    }
+                    PreviewAction::CopyFiles | PreviewAction::CopyPaths => {}
+                }
+            }
             None => {}
         }
     }
 
-    fn step_preview(&mut self, ctx: &Context, delta: isize) {
-        let Some(preview) = &self.preview else { return };
-        let target = preview.index.checked_add_signed(delta).filter(|&i| i < self.gallery.order().len());
-        if let Some(target) = target {
-            self.show_preview(ctx, target);
-        }
-    }
-
-    /// Keeps the preview on its file when the gallery order changes underneath it.
-    fn sync_preview(&mut self) {
-        let Some(preview) = &mut self.preview else { return };
-        if self.library.get(&preview.path).is_none() {
-            self.preview = None;
-            return;
-        }
-        let order = self.gallery.order();
-        if order.get(preview.index) == Some(&preview.path) {
-            return;
-        }
-        match order.iter().position(|p| *p == preview.path) {
-            Some(i) => preview.index = i,
-            None => self.preview = None,
-        }
-    }
-
-    fn focus_id(&self) -> Option<usize> {
-        self.selection.focus().filter(|&i| i < self.gallery.order().len())
-    }
-
-    fn move_focus(&mut self, dir: Dir, extend: bool) {
-        let target = match self.focus_id() {
-            Some(from) => layout::neighbor(self.gallery.layout(), from, dir),
-            None => Some(0),
-        };
-        if let Some(target) = target {
-            self.selection.move_to(target, extend);
-            self.scroll_to = Some(target);
-        }
-    }
-
     fn toggle_focus_pin(&mut self) {
-        let Some(root) = self.root.clone() else { return };
-        let Some(path) = self.focus_id().map(|i| self.gallery.order()[i].clone()) else { return };
-        if self.library.get(&path).is_some() && path.exists() {
-            self.config.toggle_pin(&root, &path);
+        let Some(tab) = self.window.active_tab() else { return };
+        let Some(path) = tab.focus_id().map(|i| tab.gallery.order()[i].clone()) else { return };
+        if tab.library.get(&path).is_some() && path.exists() {
+            self.config.toggle_pin(&tab.root, &path);
             self.touch_config();
         }
-    }
-
-    /// Absolute paths of the selection, or of the focused tile when nothing is selected.
-    fn selected_paths(&self) -> Vec<PathBuf> {
-        if let Some(preview) = &self.preview {
-            return vec![absolute(&preview.path)];
-        }
-        let order = self.gallery.order();
-        let mut paths: Vec<PathBuf> =
-            self.selection.selected().filter_map(|i| order.get(i)).map(|p| absolute(p)).collect();
-        if paths.is_empty()
-            && let Some(i) = self.focus_id()
-        {
-            paths.push(absolute(&order[i]));
-        }
-        paths
     }
 
     fn notify(&mut self, ctx: &Context, text: String) {
@@ -590,11 +427,12 @@ impl ImageMozApp {
     }
 
     fn copy_files(&mut self, ctx: &Context) {
-        let files = self.selected_paths();
+        let Some(tab) = self.window.active_tab() else { return };
+        let files = tab.selected_paths();
         if files.is_empty() {
             return;
         }
-        let focus = match &self.preview {
+        let focus = match &tab.preview {
             Some(preview) => {
                 if let Some(img) = preview.decoded_for(&preview.path) {
                     self.finish_copy(ctx, files, Some((*img).clone()));
@@ -602,14 +440,14 @@ impl ImageMozApp {
                 }
                 Some(preview.path.clone())
             }
-            None => self.focus_id().map(|i| self.gallery.order()[i].clone()),
+            None => tab.focus_id().map(|i| tab.gallery.order()[i].clone()),
         };
         let Some(focus) = focus else {
             self.finish_copy(ctx, files, None);
             return;
         };
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let wake = Self::wake(ctx);
+        let wake = wake(ctx);
         std::thread::spawn(move || {
             let _ = tx.send(formats::decode(&focus));
             wake();
@@ -641,7 +479,7 @@ impl ImageMozApp {
     }
 
     fn copy_paths(&mut self, ctx: &Context) {
-        let paths = self.selected_paths();
+        let paths = self.window.active_tab().map(Tab::selected_paths).unwrap_or_default();
         if paths.is_empty() {
             return;
         }
@@ -653,145 +491,154 @@ impl ImageMozApp {
         self.notify(ctx, message);
     }
 
-    /// Re-targets selection positions when the gallery order was rebuilt.
-    fn remap_selection(&mut self, ctx: &Context) {
-        let version = self.gallery.order_version();
-        if version == self.order_snapshot.0 {
-            return;
-        }
-        let new_order = self.gallery.order();
-        if new_order != self.order_snapshot.1.as_slice() {
-            let positions: HashMap<&PathBuf, usize> =
-                new_order.iter().enumerate().map(|(i, p)| (p, i)).collect();
-            let old = &self.order_snapshot.1;
-            self.selection.remap(|i| old.get(i).and_then(|p| positions.get(p).copied()));
-            ctx.request_repaint();
-        }
-        self.order_snapshot = (version, self.gallery.order().to_vec());
-    }
-
     fn pick_folder(&mut self, ctx: &Context) {
         let mut dialog = rfd::FileDialog::new();
-        if let Some(root) = self.root.as_ref().filter(|r| r.is_dir()) {
-            dialog = dialog.set_directory(root);
+        if let Some(tab) = self.window.active_tab().filter(|t| t.root.is_dir()) {
+            dialog = dialog.set_directory(&tab.root);
         }
         if let Some(folder) = dialog.pick_folder() {
-            self.open_folder(ctx, folder);
+            self.open_target(ctx, OpenTarget { folder, select: None });
         }
     }
 
     fn sync_title(&mut self, ctx: &Context) {
-        let title = window_title(self.root.as_deref());
+        let title = window_title(self.window.active_tab().map(|t| t.root.as_path()));
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
     }
 
+    /// Applies toolbar edits of the folder settings to the active tab and the config.
+    fn apply_folder_settings(&mut self, ctx: &Context, settings: FolderSettings) {
+        let Some(tab) = self.window.active_tab_mut() else { return };
+        if settings.recursive != tab.recursive {
+            tab.reopen(ctx, &mut self.thumbs, settings);
+        }
+        tab.sort = settings.sort;
+        if self.config.set_folder_settings(&tab.root, settings) {
+            self.config_dirty = true;
+        }
+    }
+
     fn central(&mut self, ui: &mut egui::Ui) {
-        let Some(root) = self.root.clone() else {
-            self.message(ui, "Aucun dossier ouvert");
+        let Some(tab) = self.window.tabs.get_mut(self.window.active) else {
+            self.open_requested |= message(ui, "Aucun dossier ouvert", true);
             return;
         };
-        if let Some(issue) = self.folder_issue {
+        if let Some(issue) = tab.folder_issue {
             let what = match issue {
                 FolderIssue::Missing => "Dossier introuvable",
                 FolderIssue::Unreadable => "Dossier inaccessible",
             };
-            self.message(ui, &format!("{what} : {}", root.display()));
+            self.open_requested |= message(ui, &format!("{what} : {}", tab.root.display()), true);
             return;
         }
-        if self.library.is_empty() {
-            self.selection.clear();
-            self.order_snapshot.1.clear();
-            let text = if self.scan.is_some() { "Chargement…" } else { "Aucune image dans ce dossier" };
-            self.message(ui, text);
+        if tab.library.is_empty() {
+            tab.selection.clear();
+            tab.order_snapshot.1.clear();
+            let text = if tab.is_scanning() { "Chargement…" } else { "Aucune image dans ce dossier" };
+            message(ui, text, false);
             return;
         }
         let view = gallery::View {
-            library: &self.library,
+            library: &tab.library,
+            thumbs: &mut self.thumbs,
             config: &mut self.config,
-            root: &root,
-            selection: &self.selection,
-            scroll_to: self.scroll_to.take(),
+            sort: tab.sort,
+            recursive: tab.recursive,
+            root: &tab.root,
+            selection: &tab.selection,
+            scroll_to: tab.scroll_to.take(),
         };
-        let out = self.gallery.show(ui, view);
-        if out.hovered != self.hovered {
-            self.hovered = out.hovered.clone();
+        let out = tab.gallery.show(ui, view);
+        if out.hovered != tab.hovered {
+            tab.hovered = out.hovered.clone();
             ui.ctx().request_repaint();
         }
+        tab.remap_selection(ui.ctx());
+        tab.resolve_pending_select(ui.ctx());
+        apply_tile_events(tab, &out);
         if out.config_changed {
-            self.touch_config();
+            self.config_dirty = true;
         }
-        self.remap_selection(ui.ctx());
-        self.apply_tile_events(&out);
     }
+}
 
-    fn apply_tile_events(&mut self, out: &gallery::Output) {
-        if let Some(c) = &out.clicked {
-            if c.modifiers.command {
-                self.selection.ctrl_click(c.id);
-            } else if c.modifiers.shift {
-                self.selection.shift_click(c.id);
-            } else {
-                self.selection.click(c.id);
-            }
-        }
-        if let Some(id) = out.double_clicked {
-            self.selection.click(id);
-            if let Some(path) = self.gallery.order().get(id) {
-                platform::open_default(&absolute(path));
-            }
-        }
-        if let Some(id) = out.right_clicked
-            && !self.selection.contains(id)
-        {
-            self.selection.click(id);
-        }
-        if let Some(id) = out.reveal
-            && let Some(path) = self.gallery.order().get(id)
-        {
-            platform::reveal_in_explorer(&absolute(path));
+fn apply_tile_events(tab: &mut Tab, out: &gallery::Output) {
+    if let Some(c) = &out.clicked {
+        if c.modifiers.command {
+            tab.selection.ctrl_click(c.id);
+        } else if c.modifiers.shift {
+            tab.selection.shift_click(c.id);
+        } else {
+            tab.selection.click(c.id);
         }
     }
+    if let Some(id) = out.double_clicked {
+        tab.selection.click(id);
+        if let Some(path) = tab.gallery.order().get(id) {
+            platform::open_default(&absolute(path));
+        }
+    }
+    if let Some(id) = out.right_clicked
+        && !tab.selection.contains(id)
+    {
+        tab.selection.click(id);
+    }
+    if let Some(id) = out.reveal
+        && let Some(path) = tab.gallery.order().get(id)
+    {
+        platform::reveal_in_explorer(&absolute(path));
+    }
+}
 
-    fn message(&mut self, ui: &mut egui::Ui, text: &str) {
-        ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() / 3.0).max(0.0));
-            ui.heading(text);
-            if self.root.is_none() || self.folder_issue.is_some() {
-                ui.add_space(12.0);
-                if ui.button("Ouvrir").clicked() {
-                    self.open_requested = true;
-                }
-            }
-        });
-    }
+/// A centered heading; returns true when its "Ouvrir" button was clicked.
+fn message(ui: &mut egui::Ui, text: &str, with_open: bool) -> bool {
+    let mut open = false;
+    ui.vertical_centered(|ui| {
+        ui.add_space((ui.available_height() / 3.0).max(0.0));
+        ui.heading(text);
+        if with_open {
+            ui.add_space(12.0);
+            open = ui.button("Ouvrir").clicked();
+        }
+    });
+    open
 }
 
 impl eframe::App for ImageMozApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.handle_forwarded(&ctx);
         self.handle_input(&ctx);
         self.pump(&ctx);
-        self.gallery.poll(&ctx, &mut self.library);
         self.poll_copy(&ctx);
         self.sync_title(&ctx);
+        if let Some(tab) = self.window.active_tab_mut() {
+            tab.sync_preview();
+        }
 
-        self.sync_preview();
-        let previewing = self.preview.is_some();
+        let tab_events = if self.window.tabs.is_empty() {
+            TabBarEvents::default()
+        } else {
+            egui::Panel::top("tabs")
+                .show(ui, |ui| tabbar::show(ui, &self.window.tabs, self.window.active))
+                .inner
+        };
+        let previewing = self.window.active_tab().is_some_and(|t| t.preview.is_some());
+        let mut settings = self
+            .window
+            .active_tab()
+            .map_or_else(FolderSettings::default, |t| FolderSettings { recursive: t.recursive, sort: t.sort });
+        let has_tab = self.window.active_tab().is_some();
         let events = if previewing {
             toolbar::ToolbarEvents::default()
         } else {
-            egui::Panel::top("toolbar").show(ui, |ui| toolbar::show(ui, &mut self.config)).inner
+            egui::Panel::top("toolbar")
+                .show(ui, |ui| toolbar::show(ui, &mut self.config, &mut settings, has_tab))
+                .inner
         };
-        let entry = self
-            .preview
-            .as_ref()
-            .map(|p| p.path.as_path())
-            .or(self.hovered.as_deref())
-            .or_else(|| self.selection.focus().and_then(|i| self.gallery.order().get(i)).map(PathBuf::as_path))
-            .and_then(|p| self.library.get(p));
         if let Some((_, at)) = &self.toast {
             let age = at.elapsed();
             if age >= TOAST_DURATION && self.pending_copy.is_none() {
@@ -800,24 +647,35 @@ impl eframe::App for ImageMozApp {
                 ctx.request_repaint_after(TOAST_DURATION.saturating_sub(age).max(Duration::from_millis(50)));
             }
         }
+        let tab = self.window.active_tab();
+        let entry = tab.and_then(|tab| {
+            tab.preview
+                .as_ref()
+                .map(|p| p.path.as_path())
+                .or(tab.hovered.as_deref())
+                .or_else(|| tab.selection.focus().and_then(|i| tab.gallery.order().get(i)).map(PathBuf::as_path))
+                .and_then(|p| tab.library.get(p))
+        });
         let info = StatusInfo {
             entry,
-            recursive: self.config.recursive,
-            total: self.library.len(),
-            selected: self.selection.len(),
-            loading: self.scan.is_some(),
+            recursive: tab.is_some_and(|t| t.recursive),
+            total: tab.map_or(0, |t| t.library.len()),
+            selected: tab.map_or(0, |t| t.selection.len()),
+            loading: tab.is_some_and(Tab::is_scanning),
             message: self.toast.as_ref().map(|(t, _)| t.as_str()),
         };
         egui::Panel::bottom("status").show(ui, |ui| status::show(ui, &info));
         if previewing {
-            let thumb = self.preview.as_ref().and_then(|p| self.gallery.thumbnail(p.index));
-            let frame = Frame::NONE.fill(preview_view::BACKGROUND);
-            egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-                if let Some(preview) = &mut self.preview {
-                    preview.poll(&ctx);
-                    preview_view::show(ui, preview, thumb.as_ref());
-                }
-            });
+            if let Some(tab) = self.window.tabs.get_mut(self.window.active) {
+                let thumb = tab.preview.as_ref().and_then(|p| tab.gallery.thumbnail(&mut self.thumbs, p.index));
+                let frame = Frame::NONE.fill(preview_view::BACKGROUND);
+                egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+                    if let Some(preview) = &mut tab.preview {
+                        preview.poll(&ctx);
+                        preview_view::show(ui, preview, thumb.as_ref());
+                    }
+                });
+            }
         } else {
             let frame = Frame::NONE.fill(ctx.global_style().visuals.panel_fill).inner_margin(Margin::same(6));
             egui::CentralPanel::default().frame(frame).show(ui, |ui| self.central(ui));
@@ -826,18 +684,26 @@ impl eframe::App for ImageMozApp {
         if events.config_changed {
             self.touch_config();
         }
-        if events.recursive_changed
-            && let Some(root) = self.root.clone()
-        {
-            self.open_folder(&ctx, root);
+        // Before the tab events: the toolbar edited the tab that was active when it was drawn.
+        if has_tab {
+            self.apply_folder_settings(&ctx, settings);
+        }
+        if let Some(index) = tab_events.activate {
+            self.window.activate(index);
+            ctx.request_repaint();
+        }
+        if let Some(index) = tab_events.close {
+            self.close_tab(&ctx, index);
         }
         if events.open || std::mem::take(&mut self.open_requested) {
             self.pick_folder(&ctx);
         }
+        self.sync_session();
         self.flush_config(&ctx);
     }
 
     fn on_exit(&mut self) {
+        self.sync_session();
         if self.config_dirty {
             self.save_config();
         }
@@ -876,14 +742,35 @@ mod tests {
         assert_eq!(fresh_space_per_pass(3), [true, false, false]);
     }
 
+    /// What the shortcut parser makes of one key press with Ctrl (and optionally Shift) held.
+    fn shortcut_for(key: Key, shift: bool, plain: bool) -> Option<TabShortcut> {
+        let modifiers = if plain {
+            Modifiers::NONE
+        } else {
+            Modifiers { ctrl: true, command: true, shift, ..Modifiers::NONE }
+        };
+        let event = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        let raw = egui::RawInput { events: vec![event], modifiers, ..Default::default() };
+        let mut found = None;
+        let _ = Context::default().run_ui(raw, |ui| found = ui.input_mut(tab_shortcut));
+        found
+    }
+
     #[test]
-    fn a_file_opens_its_parent_and_a_folder_opens_itself() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("a.png");
-        std::fs::write(&file, b"x").unwrap();
-        assert_eq!(folder_to_open(&file).as_deref(), Some(dir.path()));
-        assert_eq!(folder_to_open(dir.path()).as_deref(), Some(dir.path()));
-        let missing = dir.path().join("nope");
-        assert_eq!(folder_to_open(&missing), Some(missing));
+    fn tab_shortcuts_need_ctrl_and_tell_shift_apart() {
+        assert_eq!(shortcut_for(Key::Tab, false, false), Some(TabShortcut::Cycle(1)));
+        assert_eq!(shortcut_for(Key::Tab, true, false), Some(TabShortcut::Cycle(-1)));
+        assert_eq!(shortcut_for(Key::T, false, false), Some(TabShortcut::New));
+        assert_eq!(shortcut_for(Key::W, false, false), Some(TabShortcut::CloseActive));
+        for key in [Key::Tab, Key::T, Key::W, Key::Num1, Key::P, Key::Space] {
+            assert_eq!(shortcut_for(key, false, true), None, "{key:?} without Ctrl");
+        }
+        assert_eq!(shortcut_for(Key::P, false, false), None);
+    }
+
+    #[test]
+    fn title_names_the_app_and_the_active_folder() {
+        assert_eq!(window_title(None), "Image Moz");
+        assert_eq!(window_title(Some(Path::new(r"D:\Pics"))), "Image Moz — D:\\Pics");
     }
 }

@@ -74,10 +74,6 @@ impl TextureCache {
         let oldest = self.map.iter().min_by_key(|(_, s)| s.used).map(|(k, _)| *k)?;
         self.map.remove(&oldest).map(|_| oldest)
     }
-
-    fn clear(&mut self) {
-        self.map.clear();
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -108,7 +104,10 @@ struct TileItem {
 /// What the gallery reads from the app each frame.
 pub struct View<'a> {
     pub library: &'a Library,
+    pub thumbs: &'a mut Thumbs,
     pub config: &'a mut Config,
+    pub sort: SortOrder,
+    pub recursive: bool,
     pub root: &'a Path,
     pub selection: &'a Selection,
     /// Tile id to bring into view this frame.
@@ -131,10 +130,14 @@ pub struct Output {
     pub config_changed: bool,
 }
 
-pub struct Gallery {
+/// Decode pool, disk cache and GPU textures, shared by every tab's `Gallery`.
+pub struct Thumbs {
     pipeline: ThumbPipeline,
     textures: TextureCache,
     backlog: VecDeque<ThumbResult>,
+}
+
+pub struct Gallery {
     lib_version: u64,
     dims_version: u64,
     sections_key: Option<(u64, SortOrder, bool)>,
@@ -145,7 +148,8 @@ pub struct Gallery {
     order: Vec<PathBuf>,
     items: Vec<TileItem>,
     meta: Vec<SectionMeta>,
-    last_wanted: Vec<ThumbKey>,
+    /// Keys of the last request sent to the pipeline; `None` forces the next one through.
+    last_wanted: Option<Vec<ThumbKey>>,
     probe_dirty: bool,
     scroll_y: f32,
     viewport_h: f32,
@@ -179,21 +183,91 @@ fn anchored_offset(new_tile_y: f32, screen_y: f32, content_h: f32, viewport_h: f
     (new_tile_y - screen_y).clamp(0.0, (content_h - viewport_h).max(0.0))
 }
 
-impl Gallery {
+impl Thumbs {
     pub fn new(ctx: &Context) -> Self {
         Self::with_cache(ctx, open_cache())
     }
 
-    fn with_cache(ctx: &Context, cache: DiskCache) -> Self {
+    pub fn with_cache(ctx: &Context, cache: DiskCache) -> Self {
         let wake: Arc<dyn Fn() + Send + Sync> = {
             let ctx = ctx.clone();
             Arc::new(move || ctx.request_repaint())
         };
-        let pipeline = ThumbPipeline::new(cache, wake);
         Self {
-            pipeline,
+            pipeline: ThumbPipeline::new(cache, wake),
             textures: TextureCache::default(),
             backlog: VecDeque::new(),
+        }
+    }
+
+    /// Drops every queued request, e.g. when no tab is left to want them.
+    pub fn cancel_requests(&self) {
+        self.pipeline.set_wanted(Vec::new());
+        self.pipeline.set_probe(Vec::new());
+    }
+
+    /// Applies finished jobs to every tab that lists the file; texture uploads are spread over frames.
+    pub fn poll(&mut self, ctx: &Context, tabs: &mut [(&mut Library, &mut Gallery)]) {
+        self.backlog.extend(self.pipeline.try_iter());
+        let mut uploads = 0;
+        while let Some(front) = self.backlog.front() {
+            let is_ready = matches!(front.outcome, ThumbOutcome::Ready(_));
+            if is_ready && uploads >= UPLOADS_PER_FRAME {
+                break;
+            }
+            let Some(result) = self.backlog.pop_front() else { break };
+            let mut claimed = false;
+            for (library, gallery) in tabs.iter_mut() {
+                let current = library.get_mut(&result.path);
+                let Some(entry) = current.filter(|e| key_for(&e.path, e.mtime, e.size) == result.key) else {
+                    continue;
+                };
+                claimed = true;
+                let dims = match &result.outcome {
+                    ThumbOutcome::Ready(thumb) => {
+                        entry.error = false;
+                        Some(thumb.orig_dims)
+                    }
+                    ThumbOutcome::Dims(dims) => Some(*dims),
+                    ThumbOutcome::Failed => {
+                        entry.error = true;
+                        None
+                    }
+                };
+                if let Some(dims) = dims.filter(|d| entry.dims != Some(*d)) {
+                    entry.dims = Some(dims);
+                    gallery.dims_version += 1;
+                }
+            }
+            if !claimed {
+                self.pipeline.forget(result.key);
+                continue;
+            }
+            if let ThumbOutcome::Ready(thumb) = result.outcome {
+                uploads += 1;
+                let size = [thumb.image.width() as usize, thumb.image.height() as usize];
+                let image = ColorImage::from_rgba_unmultiplied(size, thumb.image.as_raw());
+                let handle = ctx.load_texture("thumb", image, TextureOptions::LINEAR);
+                if let Some(old) = self.textures.insert(result.key, handle) {
+                    self.pipeline.forget(old);
+                }
+            }
+        }
+        if !self.backlog.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+impl Default for Gallery {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Gallery {
+    pub fn new() -> Self {
+        Self {
             lib_version: 0,
             dims_version: 0,
             sections_key: None,
@@ -204,7 +278,7 @@ impl Gallery {
             order: Vec::new(),
             items: Vec::new(),
             meta: Vec::new(),
-            last_wanted: Vec::new(),
+            last_wanted: None,
             probe_dirty: true,
             scroll_y: 0.0,
             viewport_h: 0.0,
@@ -224,9 +298,15 @@ impl Gallery {
     }
 
     /// The cached thumbnail texture of tile `id`, if already uploaded.
-    pub fn thumbnail(&mut self, id: usize) -> Option<TextureHandle> {
+    pub fn thumbnail(&self, thumbs: &mut Thumbs, id: usize) -> Option<TextureHandle> {
         let key = self.items.get(id)?.key;
-        self.textures.get(key).cloned()
+        thumbs.textures.get(key).cloned()
+    }
+
+    /// The tab became the visible one: its thumbnail requests must replace the previous tab's.
+    pub fn activate(&mut self) {
+        self.last_wanted = None;
+        self.probe_dirty = true;
     }
 
     pub fn order_version(&self) -> u64 {
@@ -239,14 +319,12 @@ impl Gallery {
         self.probe_dirty = true;
     }
 
-    /// A different folder: drop every texture and forget what the pipeline already produced.
-    pub fn reset(&mut self) {
-        self.pipeline.set_wanted(Vec::new());
-        self.pipeline.set_probe(Vec::new());
-        self.pipeline.forget_all();
-        self.last_wanted.clear();
-        self.textures.clear();
-        self.backlog.clear();
+    /// The folder is re-read: rebuild from scratch. Textures stay, they are keyed by file state.
+    pub fn reset(&mut self, thumbs: &mut Thumbs) {
+        thumbs.pipeline.set_wanted(Vec::new());
+        thumbs.pipeline.set_probe(Vec::new());
+        thumbs.pipeline.forget_all();
+        self.last_wanted = None;
         self.sections_key = None;
         self.sig = None;
         self.anchor = None;
@@ -256,30 +334,30 @@ impl Gallery {
     }
 
     /// The entry is about to be modified, removed or re-read: let its thumb and dims be redone.
-    pub fn forget_entry(&mut self, entry: &Entry) {
+    pub fn forget_entry(&mut self, thumbs: &mut Thumbs, entry: &Entry) {
         let key = key_for(&entry.path, entry.mtime, entry.size);
-        self.pipeline.forget(key);
-        self.textures.remove(key);
-        self.last_wanted.clear();
+        thumbs.pipeline.forget(key);
+        thumbs.textures.remove(key);
+        self.last_wanted = None;
     }
 
     /// Applies a watcher change, releasing the pipeline state of the entry it replaces or drops.
-    pub fn apply_change(&mut self, library: &mut Library, change: &FsChange, now: Instant) {
+    pub fn apply_change(&mut self, thumbs: &mut Thumbs, library: &mut Library, change: &FsChange, now: Instant) {
         if let FsChange::Upsert(path) | FsChange::Remove(path) = change
             && let Some(old) = library.get(path)
         {
-            self.forget_entry(old);
+            self.forget_entry(thumbs, old);
         }
         library.apply(change, now);
         self.library_changed();
     }
 
     /// Swaps in a rescan result; entries it no longer contains (or contains changed) are forgotten.
-    pub fn replace_entries(&mut self, library: &mut Library, entries: Vec<Entry>) {
+    pub fn replace_entries(&mut self, thumbs: &mut Thumbs, library: &mut Library, entries: Vec<Entry>) {
         let kept: HashSet<ThumbKey> = entries.iter().map(|e| key_for(&e.path, e.mtime, e.size)).collect();
         for old in library.iter() {
             if !kept.contains(&key_for(&old.path, old.mtime, old.size)) {
-                self.forget_entry(old);
+                self.forget_entry(thumbs, old);
             }
         }
         library.replace_all(entries);
@@ -287,55 +365,11 @@ impl Gallery {
     }
 
     /// User refresh: failed tiles get another attempt.
-    pub fn retry_failed(&mut self, library: &mut Library) {
+    pub fn retry_failed(&mut self, thumbs: &mut Thumbs, library: &mut Library) {
         library.clear_errors();
-        self.pipeline.forget_all();
-        self.last_wanted.clear();
+        thumbs.pipeline.forget_all();
+        self.last_wanted = None;
         self.library_changed();
-    }
-
-    /// Applies finished thumbnail jobs; texture uploads are spread over several frames.
-    pub fn poll(&mut self, ctx: &Context, library: &mut Library) {
-        self.backlog.extend(self.pipeline.try_iter());
-        let mut uploads = 0;
-        while let Some(front) = self.backlog.front() {
-            let is_ready = matches!(front.outcome, ThumbOutcome::Ready(_));
-            if is_ready && uploads >= UPLOADS_PER_FRAME {
-                break;
-            }
-            let Some(result) = self.backlog.pop_front() else { break };
-            let current = library.get_mut(&result.path);
-            let Some(entry) = current.filter(|e| key_for(&e.path, e.mtime, e.size) == result.key) else {
-                self.pipeline.forget(result.key);
-                continue;
-            };
-            match result.outcome {
-                ThumbOutcome::Ready(thumb) => {
-                    uploads += 1;
-                    entry.error = false;
-                    if entry.dims != Some(thumb.orig_dims) {
-                        entry.dims = Some(thumb.orig_dims);
-                        self.dims_version += 1;
-                    }
-                    let size = [thumb.image.width() as usize, thumb.image.height() as usize];
-                    let image = ColorImage::from_rgba_unmultiplied(size, thumb.image.as_raw());
-                    let handle = ctx.load_texture("thumb", image, TextureOptions::LINEAR);
-                    if let Some(old) = self.textures.insert(result.key, handle) {
-                        self.pipeline.forget(old);
-                    }
-                }
-                ThumbOutcome::Dims(dims) => {
-                    if entry.dims != Some(dims) {
-                        entry.dims = Some(dims);
-                        self.dims_version += 1;
-                    }
-                }
-                ThumbOutcome::Failed => entry.error = true,
-            }
-        }
-        if !self.backlog.is_empty() {
-            ctx.request_repaint();
-        }
     }
 
     fn signature(&self, view: &View, width: f32) -> LayoutSig {
@@ -348,8 +382,8 @@ impl Gallery {
             size: cfg.target_size.round() as i32,
             kind: cfg.layout,
             rule: cfg.bento_rule,
-            sort: cfg.sort,
-            recursive: cfg.recursive,
+            sort: view.sort,
+            recursive: view.recursive,
             pins: state.map_or(0, |s| s.pins.len()),
             collapsed: state.map_or(0, |s| s.collapsed.len()),
         }
@@ -359,7 +393,7 @@ impl Gallery {
         let cfg = &*view.config;
         let sections_key = (sig.lib, sig.sort, sig.recursive);
         if self.sections_key != Some(sections_key) {
-            self.sections = view.library.sections(cfg.sort);
+            self.sections = view.library.sections(view.sort);
             self.sections_key = Some(sections_key);
         }
         let state = cfg.folder(view.root);
@@ -371,7 +405,7 @@ impl Gallery {
         let mut layout_sections = Vec::with_capacity(self.sections.len());
         for section in &self.sections {
             let key = collapse_key(&section.rel_dir);
-            let is_collapsed = cfg.recursive && collapsed.is_some_and(|c| c.contains(&key));
+            let is_collapsed = view.recursive && collapsed.is_some_and(|c| c.contains(&key));
             let mut items = Vec::new();
             if !is_collapsed {
                 for path in &section.items {
@@ -396,7 +430,7 @@ impl Gallery {
             }
             let label = if section.rel_dir.is_empty() { ".".to_string() } else { section.rel_dir.clone() };
             layout_sections.push(LayoutSection {
-                header: cfg.recursive.then(|| label.clone()),
+                header: view.recursive.then(|| label.clone()),
                 collapsed: is_collapsed,
                 items,
             });
@@ -418,7 +452,7 @@ impl Gallery {
         self.order_version += 1;
     }
 
-    fn update_probes(&mut self, library: &Library) {
+    fn update_probes(&mut self, thumbs: &Thumbs, library: &Library) {
         let mut jobs = Vec::new();
         for path in self.sections.iter().flat_map(|s| &s.items) {
             if let Some(e) = library.get(path)
@@ -428,11 +462,11 @@ impl Gallery {
                 jobs.push(ThumbJob { path: path.clone(), key: key_for(path, e.mtime, e.size) });
             }
         }
-        self.pipeline.set_probe(jobs);
+        thumbs.pipeline.set_probe(jobs);
         self.probe_dirty = false;
     }
 
-    pub fn show(&mut self, ui: &mut Ui, view: View) -> Output {
+    pub fn show(&mut self, ui: &mut Ui, mut view: View) -> Output {
         let width = ui.available_width().floor().max(1.0);
         let sig = self.signature(&view, width);
         let mut forced_offset = self.reset_scroll.then_some(0.0);
@@ -455,7 +489,7 @@ impl Gallery {
             }
         }
         if self.probe_dirty {
-            self.update_probes(view.library);
+            self.update_probes(view.thumbs, view.library);
         }
 
         let mut area = ScrollArea::vertical()
@@ -472,7 +506,7 @@ impl Gallery {
                 let origin = ui.max_rect().min.to_vec2();
                 ui.scroll_to_rect(tile.rect.translate(origin), None);
             }
-            self.draw(ui, viewport, &view, width, &mut out, &mut toggled);
+            self.draw(ui, viewport, &mut view, width, &mut out, &mut toggled);
         });
         self.scroll_y = scroll.state.offset.y;
         self.viewport_h = scroll.inner_rect.height();
@@ -498,7 +532,7 @@ impl Gallery {
         &mut self,
         ui: &mut Ui,
         viewport: Rect,
-        view: &View,
+        view: &mut View,
         width: f32,
         out: &mut Output,
         toggled: &mut Option<String>,
@@ -507,7 +541,7 @@ impl Gallery {
             ui.allocate_exact_size(vec2(width, self.layout.height.max(1.0)), Sense::hover());
         let origin = content.min.to_vec2();
         let near = viewport.expand2(vec2(0.0, viewport.height()));
-        let recursive = view.config.recursive;
+        let recursive = view.recursive;
         let now = Instant::now();
         let mut fading = false;
         let mut first: Option<(f32, f32, usize)> = None;
@@ -566,7 +600,7 @@ impl Gallery {
             let key = self.items[id].key;
             let entry = view.library.get(path);
             let in_view = rel.intersects(viewport);
-            let loaded = self.textures.contains(key);
+            let loaded = view.thumbs.textures.contains(key);
             if !loaded && !entry.is_some_and(|e| e.error) {
                 let job = ThumbJob { path: path.clone(), key };
                 if in_view {
@@ -578,7 +612,7 @@ impl Gallery {
             }
             if !in_view {
                 if loaded {
-                    self.textures.get(key);
+                    view.thumbs.textures.get(key);
                 }
                 continue;
             }
@@ -589,7 +623,7 @@ impl Gallery {
             let response = ui.interact(rect, Id::new(("tile", id)), Sense::click());
             let painter = ui.painter();
             painter.rect_filled(rect, CornerRadius::same(2), PLACEHOLDER);
-            if let Some(texture) = self.textures.get(key) {
+            if let Some(texture) = view.thumbs.textures.get(key) {
                 painter.image(texture.id(), fit(rect, texture.size_vec2()), FULL_UV, Color32::WHITE);
             } else if entry.is_some_and(|e| e.error) {
                 painter.text(
@@ -655,15 +689,15 @@ impl Gallery {
         }
         far_jobs.sort_by(|a, b| a.0.total_cmp(&b.0));
         near_jobs.extend(far_jobs.into_iter().map(|(_, job)| job));
-        self.textures.fit_cap(near_tiles);
-        self.request_thumbs(near_jobs);
+        view.thumbs.textures.fit_cap(near_tiles);
+        self.request_thumbs(view.thumbs, near_jobs);
     }
 
-    fn request_thumbs(&mut self, jobs: Vec<ThumbJob>) {
+    fn request_thumbs(&mut self, thumbs: &Thumbs, jobs: Vec<ThumbJob>) {
         let keys: Vec<ThumbKey> = jobs.iter().map(|j| j.key).collect();
-        if keys != self.last_wanted {
-            self.last_wanted = keys;
-            self.pipeline.set_wanted(jobs);
+        if self.last_wanted.as_ref() != Some(&keys) {
+            self.last_wanted = Some(keys);
+            thumbs.pipeline.set_wanted(jobs);
         }
     }
 }
@@ -739,11 +773,10 @@ mod tests {
         assert!(cache.contains(key_for(Path::new("C:/pics/A.PNG"), mtime, 10)));
     }
 
-    fn test_gallery(dir: &Path) -> (Context, Gallery) {
+    fn test_thumbs(dir: &Path) -> (Context, Thumbs, Gallery) {
         let ctx = Context::default();
         let cache = DiskCache::open(dir.join("cache")).unwrap();
-        let gallery = Gallery::with_cache(&ctx, cache);
-        (ctx, gallery)
+        (ctx.clone(), Thumbs::with_cache(&ctx, cache), Gallery::new())
     }
 
     fn library_of(dir: &Path) -> Library {
@@ -752,15 +785,16 @@ mod tests {
         library
     }
 
-    fn probe(gallery: &mut Gallery, library: &Library) {
+    fn probe(thumbs: &Thumbs, gallery: &mut Gallery, library: &Library) {
         gallery.sections = library.sections(SortOrder::default());
         gallery.library_changed();
-        gallery.update_probes(library);
+        gallery.update_probes(thumbs, library);
     }
 
-    /// Polls the gallery until `done` holds for the entry at `path`, or 5 s elapse.
+    /// Polls until `done` holds for the entry at `path`, or 5 s elapse.
     fn settles(
         ctx: &Context,
+        thumbs: &mut Thumbs,
         gallery: &mut Gallery,
         library: &mut Library,
         path: &Path,
@@ -768,7 +802,7 @@ mod tests {
     ) -> bool {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
-            gallery.poll(ctx, library);
+            thumbs.poll(ctx, &mut [(&mut *library, &mut *gallery)]);
             if library.get(path).is_some_and(&done) {
                 return true;
             }
@@ -790,17 +824,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("a.png");
         write_image(&img);
-        let (ctx, mut gallery) = test_gallery(dir.path());
+        let (ctx, mut thumbs, mut gallery) = test_thumbs(dir.path());
         let mut library = library_of(dir.path());
-        probe(&mut gallery, &library);
-        assert!(settles(&ctx, &mut gallery, &mut library, &img, has_dims));
+        probe(&thumbs, &mut gallery, &library);
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
 
         let now = Instant::now();
-        gallery.apply_change(&mut library, &FsChange::Remove(img.clone()), now);
-        gallery.apply_change(&mut library, &FsChange::Upsert(img.clone()), now);
+        gallery.apply_change(&mut thumbs, &mut library, &FsChange::Remove(img.clone()), now);
+        gallery.apply_change(&mut thumbs, &mut library, &FsChange::Upsert(img.clone()), now);
         assert_eq!(library.get(&img).unwrap().dims, None);
-        probe(&mut gallery, &library);
-        assert!(settles(&ctx, &mut gallery, &mut library, &img, has_dims));
+        probe(&thumbs, &mut gallery, &library);
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
     }
 
     #[test]
@@ -808,15 +842,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("a.png");
         write_image(&img);
-        let (ctx, mut gallery) = test_gallery(dir.path());
+        let (ctx, mut thumbs, mut gallery) = test_thumbs(dir.path());
         let mut library = library_of(dir.path());
-        probe(&mut gallery, &library);
-        assert!(settles(&ctx, &mut gallery, &mut library, &img, has_dims));
+        probe(&thumbs, &mut gallery, &library);
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
 
-        gallery.replace_entries(&mut library, Vec::new());
-        gallery.replace_entries(&mut library, crate::library::scan(dir.path(), false).unwrap());
-        probe(&mut gallery, &library);
-        assert!(settles(&ctx, &mut gallery, &mut library, &img, has_dims));
+        gallery.replace_entries(&mut thumbs, &mut library, Vec::new());
+        gallery.replace_entries(&mut thumbs, &mut library, crate::library::scan(dir.path(), false).unwrap());
+        probe(&thumbs, &mut gallery, &library);
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
     }
 
     #[test]
@@ -824,19 +858,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("a.png");
         write_image(&img);
-        let (ctx, mut gallery) = test_gallery(dir.path());
+        let (ctx, mut thumbs, mut gallery) = test_thumbs(dir.path());
         let mut library = library_of(dir.path());
-        probe(&mut gallery, &library);
-        while gallery.backlog.is_empty() {
-            gallery.backlog.extend(gallery.pipeline.try_iter());
+        probe(&thumbs, &mut gallery, &library);
+        while thumbs.backlog.is_empty() {
+            thumbs.backlog.extend(thumbs.pipeline.try_iter());
             std::thread::sleep(Duration::from_millis(10));
         }
 
         library.apply(&FsChange::Remove(img.clone()), Instant::now());
-        gallery.poll(&ctx, &mut library);
+        thumbs.poll(&ctx, &mut [(&mut library, &mut gallery)]);
         library.apply(&FsChange::Upsert(img.clone()), Instant::now());
-        probe(&mut gallery, &library);
-        assert!(settles(&ctx, &mut gallery, &mut library, &img, has_dims));
+        probe(&thumbs, &mut gallery, &library);
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
     }
 
     #[test]
@@ -844,15 +878,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bad = dir.path().join("bad.png");
         std::fs::write(&bad, b"not an image").unwrap();
-        let (ctx, mut gallery) = test_gallery(dir.path());
+        let (ctx, mut thumbs, mut gallery) = test_thumbs(dir.path());
         let mut library = library_of(dir.path());
-        probe(&mut gallery, &library);
-        assert!(settles(&ctx, &mut gallery, &mut library, &bad, |e| e.error));
+        probe(&thumbs, &mut gallery, &library);
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &bad, |e| e.error));
 
-        gallery.retry_failed(&mut library);
+        gallery.retry_failed(&mut thumbs, &mut library);
         assert!(!library.get(&bad).unwrap().error);
-        probe(&mut gallery, &library);
-        assert!(settles(&ctx, &mut gallery, &mut library, &bad, |e| e.error));
+        probe(&thumbs, &mut gallery, &library);
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &bad, |e| e.error));
+    }
+
+    #[test]
+    fn result_goes_to_the_tab_that_lists_the_file() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let img = dir_a.path().join("a.png");
+        write_image(&img);
+        let (ctx, mut thumbs, mut gallery_a) = test_thumbs(dir_a.path());
+        let (mut lib_a, mut lib_b) = (library_of(dir_a.path()), library_of(dir_b.path()));
+        let mut gallery_b = Gallery::new();
+        probe(&thumbs, &mut gallery_a, &lib_a);
+
+        let start = Instant::now();
+        while lib_a.get(&img).unwrap().dims.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5), "result never routed to tab A");
+            thumbs.poll(&ctx, &mut [(&mut lib_b, &mut gallery_b), (&mut lib_a, &mut gallery_a)]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(lib_b.is_empty());
+    }
+
+    #[test]
+    fn result_for_a_file_no_tab_lists_is_dropped_and_requestable_again() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let img = dir_a.path().join("a.png");
+        write_image(&img);
+        let (ctx, mut thumbs, mut gallery_a) = test_thumbs(dir_a.path());
+        let (mut lib_a, mut lib_b) = (library_of(dir_a.path()), library_of(dir_b.path()));
+        let mut gallery_b = Gallery::new();
+        probe(&thumbs, &mut gallery_a, &lib_a);
+        while thumbs.backlog.is_empty() {
+            thumbs.backlog.extend(thumbs.pipeline.try_iter());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        thumbs.poll(&ctx, &mut [(&mut lib_b, &mut gallery_b)]);
+        assert!(thumbs.backlog.is_empty());
+        assert_eq!(lib_a.get(&img).unwrap().dims, None);
+        probe(&thumbs, &mut gallery_a, &lib_a);
+        assert!(settles(&ctx, &mut thumbs, &mut gallery_a, &mut lib_a, &img, has_dims));
     }
 
     #[test]
