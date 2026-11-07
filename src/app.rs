@@ -30,6 +30,10 @@ const TOAST_DURATION: Duration = Duration::from_secs(2);
 const APP_NAME: &str = "Image Moz";
 const DEFAULT_SIZE: (f32, f32) = (1200.0, 800.0);
 const MIN_SIZE_PTS: [f32; 2] = [480.0, 320.0];
+/// After a restore, the stored active window is raised once all windows exist, and focus changes
+/// the OS makes while they open are not taken for the user's choice, until this much time has passed.
+const RESTORE_RAISE_AT: Duration = Duration::from_millis(400);
+const RESTORE_FOCUS_FOR: Duration = Duration::from_millis(1000);
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
 
 struct PendingCopy {
@@ -130,6 +134,9 @@ pub struct ImageMozApp {
     pending_copy: Option<PendingCopy>,
     instance: Option<Primary>,
     published_target: isize,
+    /// Window to bring forward after a restore, while the OS hands the focus to the last one created.
+    restore_focus: Option<(WindowId, Instant)>,
+    restore_raised: bool,
 }
 
 /// Everything decided before the first window exists: the session to restore and the root's placement.
@@ -255,7 +262,8 @@ impl ImageMozApp {
             }
             ids.push(id);
         }
-        if let Some(&id) = ids.get(active_window) {
+        let restore_focus = ids.get(active_window).copied().filter(|_| ids.len() > 1);
+        if let Some(id) = restore_focus {
             windows.touch(id);
         }
         let config_path = Config::default_path();
@@ -277,6 +285,8 @@ impl ImageMozApp {
             pending_copy: None,
             instance,
             published_target: 0,
+            restore_focus: restore_focus.map(|id| (id, Instant::now())),
+            restore_raised: false,
         };
         if let Some(target) = cli {
             let dest = app.windows.last_active();
@@ -414,7 +424,10 @@ impl ImageMozApp {
             self.root_scale = scale;
         }
         if info.focused == Some(true) {
-            self.windows.touch(id);
+            let held_by_restore = self.restore_focus.is_some_and(|(want, _)| want != id);
+            if !held_by_restore {
+                self.windows.touch(id);
+            }
             if let Some(hwnd) = platform::foreground_own_window()
                 && let Some(window) = self.windows.get_mut(id)
             {
@@ -558,9 +571,23 @@ impl ImageMozApp {
         let visible: HashSet<u64> =
             self.windows.iter().filter_map(|w| w.state.active_tab()).map(|t| t.gallery.id()).collect();
         self.thumbs.retain_galleries(|id| visible.contains(&id));
+        self.keep_restored_focus(ctx);
         self.publish_target();
         self.sync_session();
         self.flush_config(ctx);
+    }
+
+    fn keep_restored_focus(&mut self, ctx: &Context) {
+        let Some((want, since)) = self.restore_focus else { return };
+        if since.elapsed() > RESTORE_FOCUS_FOR || self.windows.get(want).is_none() {
+            self.restore_focus = None;
+            return;
+        }
+        if !self.restore_raised && since.elapsed() >= RESTORE_RAISE_AT {
+            self.restore_raised = true;
+            self.raise(ctx, want);
+        }
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 
     fn expire_toast(&mut self, ctx: &Context) {
@@ -1068,7 +1095,37 @@ impl ImageMozApp {
         {
             window.geometry = Some(BarGeometry { bar, tabs: tab_events.tab_rects, origin_px, scale });
         }
+        self.log_tab_layout(id);
         self.paint_drag_ghost(&ctx, screen);
+    }
+
+    /// Debug log of where each tab sits on screen (physical pixels), whenever it changes.
+    /// The end-to-end suite reads it because secondary windows are not reachable through UI Automation.
+    fn log_tab_layout(&mut self, id: WindowId) {
+        if !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
+        let Some(window) = self.windows.get(id) else { return };
+        let (Some(geometry), Some(bounds)) = (&window.geometry, window.bounds) else { return };
+        let (origin, scale) = (geometry.origin_px, geometry.scale);
+        let tabs: Vec<String> = window
+            .state
+            .tabs
+            .iter()
+            .zip(&geometry.tabs)
+            .map(|(tab, r)| {
+                let (left, right) = ((origin.x + r.min.x * scale).round(), (origin.x + r.max.x * scale).round());
+                let (top, bottom) = ((origin.y + r.min.y * scale).round(), (origin.y + r.max.y * scale).round());
+                format!("{}:{left}:{right}:{top}:{bottom}", tabbar::title(tab))
+            })
+            .collect();
+        let line = format!("tabbar outer={},{} tabs={}", bounds.x, bounds.y, tabs.join("|"));
+        if let Some(window) = self.windows.get_mut(id)
+            && window.logged_tabs != line
+        {
+            log::debug!("{line}");
+            window.logged_tabs = line;
+        }
     }
 
     fn show_secondary(&mut self, ctx: &Context, id: WindowId) {

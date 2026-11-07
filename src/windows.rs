@@ -67,13 +67,15 @@ pub struct AppWindow {
     /// Tab bar rects of the current frame; `None` when the window drew none.
     pub geometry: Option<BarGeometry>,
     pub placement: Option<Placement>,
+    /// Last tab layout written to the debug log, to log only changes.
+    pub logged_tabs: String,
     /// Title last sent to the native window.
     pub title: String,
 }
 
 impl AppWindow {
     fn new(id: WindowId, state: WindowState) -> Self {
-        Self { id, state, initial: None, bounds: None, hwnd: None, geometry: None, placement: None, title: String::new() }
+        Self { id, state, initial: None, bounds: None, hwnd: None, geometry: None, placement: None, logged_tabs: String::new(), title: String::new() }
     }
 }
 

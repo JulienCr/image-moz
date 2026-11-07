@@ -24,7 +24,7 @@ pub struct DragView {
     pub marker: Option<usize>,
 }
 
-fn title(tab: &Tab) -> String {
+pub fn title(tab: &Tab) -> String {
     match tab.unseen {
         0 => tab.label(),
         n => format!("{} ({n})", tab.label()),
