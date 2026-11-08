@@ -8,7 +8,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::Sender;
 use notify::event::{CreateKind, RemoveKind, RenameMode};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode};
+use notify::event::MetadataKind;
+use notify::{Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debouncer_opt};
 
 use crate::formats::is_supported;
@@ -18,6 +19,8 @@ const DEBOUNCE: Duration = Duration::from_millis(200);
 const TICK: Duration = Duration::from_millis(100);
 const STABLE_FOR: Duration = Duration::from_millis(300);
 const ROOT_CHECK: Duration = Duration::from_secs(1);
+/// Measured on a 3000-file recursive WSL folder: about 30 ms per scan, 0.5% of a core.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 type Signature = (u64, Option<SystemTime>);
 
@@ -70,9 +73,50 @@ impl Sink {
     }
 }
 
+/// Held only to keep the OS watcher or poll thread alive.
+#[allow(dead_code)]
+enum Backend {
+    Native(Debouncer<RecommendedWatcher, NoCache>),
+    Poll(Debouncer<PollWatcher, NoCache>),
+}
+
+/// True for folders where Windows delivers no change notifications (WSL shares over 9P).
+pub fn needs_polling(path: &Path) -> bool {
+    is_wsl_path(path) || mapped_remote(path).is_some_and(|remote| is_wsl_path(Path::new(&remote)))
+}
+
+/// `\\wsl.localhost\`, `\\wsl$\` and their `\\?\UNC\` forms, case-insensitive.
+fn is_wsl_path(path: &Path) -> bool {
+    let text = path.to_string_lossy().to_lowercase().replace('/', r"\");
+    let rest = text.strip_prefix(r"\\?\unc\").or_else(|| text.strip_prefix(r"\\"));
+    rest.is_some_and(|r| ["wsl.localhost\\", "wsl$\\"].iter().any(|host| r.starts_with(host)))
+}
+
+/// The UNC target of a mapped drive letter (`Z:` to `\\wsl.localhost\Ubuntu`), if `path` is on one.
+fn mapped_remote(path: &Path) -> Option<String> {
+    use windows::Win32::NetworkManagement::WNet::WNetGetConnectionW;
+    use windows::core::{PCWSTR, PWSTR};
+
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let local: Vec<u16> = format!("{}:", bytes[0] as char).encode_utf16().chain([0]).collect();
+    let mut buffer = [0u16; 512];
+    let mut len = buffer.len() as u32;
+    // SAFETY: both pointers reference live buffers and `len` is the capacity of `buffer` in u16s.
+    let status = unsafe { WNetGetConnectionW(PCWSTR(local.as_ptr()), Some(PWSTR(buffer.as_mut_ptr())), &mut len) };
+    if status.0 != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..end]))
+}
+
 /// Watches a folder and forwards stabilized changes; dropping it stops watching.
 pub struct FolderWatcher {
-    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
+    _debouncer: Backend,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -88,15 +132,20 @@ impl FolderWatcher {
         let sink = Arc::new(Sink { tx, wake, pending: Mutex::new(HashMap::new()) });
         let handler_sink = Arc::clone(&sink);
         // NoCache: the default file-id cache walks and opens every file, blocking for seconds.
-        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
-            DEBOUNCE,
-            None,
-            move |result: DebounceEventResult| handle_batch(&handler_sink, recursive, result),
-            NoCache,
-            notify::Config::default(),
-        )?;
+        let handler = move |result: DebounceEventResult| handle_batch(&handler_sink, recursive, result);
         let mode = if recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
-        debouncer.watch(root, mode)?;
+        let backend = if needs_polling(root) {
+            log::debug!("{} gets no OS notifications, polling every {POLL_INTERVAL:?}", root.display());
+            let config = notify::Config::default().with_poll_interval(POLL_INTERVAL);
+            let mut debouncer = new_debouncer_opt::<_, PollWatcher, NoCache>(DEBOUNCE, None, handler, NoCache, config)?;
+            debouncer.watch(root, mode)?;
+            Backend::Poll(debouncer)
+        } else {
+            let config = notify::Config::default();
+            let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(DEBOUNCE, None, handler, NoCache, config)?;
+            debouncer.watch(root, mode)?;
+            Backend::Native(debouncer)
+        };
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -119,7 +168,7 @@ impl FolderWatcher {
             })
             .map_err(notify::Error::io)?;
 
-        Ok(FolderWatcher { _debouncer: debouncer, stop, thread: Some(thread) })
+        Ok(FolderWatcher { _debouncer: backend, stop, thread: Some(thread) })
     }
 }
 
@@ -208,6 +257,14 @@ fn apply_event(
                 }
             }
         },
+        // PollWatcher reports a rewritten file as a bare mtime change.
+        EventKind::Modify(notify::event::ModifyKind::Metadata(MetadataKind::WriteTime)) => {
+            for path in &event.paths {
+                if is_supported(path) {
+                    touch(pending, path);
+                }
+            }
+        }
         EventKind::Modify(notify::event::ModifyKind::Metadata(_)) => {}
         EventKind::Modify(_) => {
             for path in &event.paths {
@@ -429,5 +486,49 @@ mod tests {
         }
         assert_eq!(seen, expected);
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Err(RecvTimeoutError::Timeout));
+    }
+
+    #[test]
+    fn wsl_paths_are_detected_case_insensitively() {
+        for yes in [
+            r"\\wsl.localhost\Ubuntu\home\me",
+            r"\\WSL.LOCALHOST\Ubuntu",
+            r"\\wsl$\Ubuntu\tmp\x",
+            r"\\WSL$\Ubuntu",
+            r"\\?\UNC\wsl.localhost\Ubuntu\tmp",
+            r"\\?\unc\wsl$\Ubuntu\tmp",
+            "//wsl.localhost/Ubuntu/tmp",
+        ] {
+            assert!(is_wsl_path(Path::new(yes)), "{yes}");
+        }
+        for no in [
+            r"D:\dev\wsl.localhost\x",
+            r"\\server\share\wsl$\x",
+            r"\\wsl.localhost.example\share",
+            r"\\wslx\Ubuntu",
+            r"\\wsl.localhost",
+            r"\\?\D:\images",
+            r"C:\Users\me",
+        ] {
+            assert!(!is_wsl_path(Path::new(no)), "{no}");
+        }
+    }
+
+    #[test]
+    fn mtime_change_from_a_polling_watcher_is_stabilized() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.png");
+        write_png(&p, 1);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sink = Sink { tx, wake: Arc::new(|| {}), pending: Mutex::new(HashMap::new()) };
+        let kind = notify::event::ModifyKind::Metadata(MetadataKind::WriteTime);
+        let event = Event::new(EventKind::Modify(kind)).add_path(p.clone());
+        apply_event(&sink, &mut sink.lock(), false, &event);
+        let deadline = Instant::now() + WAIT;
+        while rx.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(TICK);
+            stabilize(&sink);
+        }
+        assert_eq!(rx.try_recv(), Ok(FsChange::Upsert(p)));
     }
 }

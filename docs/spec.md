@@ -56,6 +56,8 @@ PNG, JPEG, WebP, BMP, GIF (première frame seulement), TIFF, EXR, HDR.
   de scroll ne bouge pas, sauf si la vue était déjà tout en haut (elle y reste
   et la nouveauté est visible).
 - `F5` force un rescan complet.
+- Les dossiers WSL (`\\wsl.localhost\`, `\\wsl$\`, ou un lecteur réseau qui y
+  pointe) n'émettent aucune notification Windows : ils sont sondés toutes les 2 s.
 
 ## 5. Tri
 

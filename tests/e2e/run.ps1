@@ -54,15 +54,21 @@ try {
     try {
       & $file.FullName -Fix $fixtures -Name $file.BaseName
     } catch {
-      $status = 'FAIL'
       $detail = $_.Exception.Message
-      Save-Shot "$($file.BaseName)-failure"
+      if ($detail -match '^SKIP: ') {
+        $status = 'SKIP'
+      } else {
+        $status = 'FAIL'
+        Save-Shot "$($file.BaseName)-failure"
+      }
     } finally {
       Stop-AllApps
     }
     $results += [pscustomobject]@{ Name = $file.BaseName; Status = $status; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Detail = $detail }
     $line = '{0,-4} {1,-22} {2,5}s' -f $status, $file.BaseName, $results[-1].Seconds
-    if ($status -eq 'FAIL') { Write-Host $line -ForegroundColor Red; Write-Host "     $detail" -ForegroundColor Red } else { Write-Host $line -ForegroundColor Green }
+    if ($status -eq 'FAIL') { Write-Host $line -ForegroundColor Red; Write-Host "     $detail" -ForegroundColor Red }
+    elseif ($status -eq 'SKIP') { Write-Host $line -ForegroundColor Yellow; Write-Host "     $detail" -ForegroundColor Yellow }
+    else { Write-Host $line -ForegroundColor Green }
   }
 } finally {
   Stop-AllApps
@@ -75,5 +81,5 @@ $isolated = $realBefore -eq $realAfter
 Write-Host ('{0,-4} {1}' -f ($(if ($isolated) { 'PASS' } else { 'FAIL' })), 'real config untouched') -ForegroundColor $(if ($isolated) { 'Green' } else { 'Red' })
 
 $failed = @($results | Where-Object Status -eq 'FAIL').Count + $(if ($isolated) { 0 } else { 1 })
-Write-Host ("`n{0} passed, {1} failed. Logs and failure screenshots: {2}" -f (@($results | Where-Object Status -eq 'PASS').Count), $failed, $out)
+Write-Host ("`n{0} passed, {1} failed, {2} skipped. Logs and failure screenshots: {3}" -f (@($results | Where-Object Status -eq 'PASS').Count), $failed, @($results | Where-Object Status -eq 'SKIP').Count, $out)
 exit $(if ($failed -gt 0) { 1 } else { 0 })

@@ -344,6 +344,10 @@ mod tests {
     #[test]
     fn folder_key_is_case_insensitive() {
         assert_eq!(folder_key(Path::new(r"D:\Dev\X")), folder_key(Path::new(r"d:\dev\x\")));
+        assert_eq!(
+            folder_key(Path::new(r"\\WSL.localhost\Ubuntu\Tmp\Pics\")),
+            folder_key(Path::new(r"\\wsl.localhost\ubuntu\tmp\pics"))
+        );
         let mut cfg = Config::default();
         assert!(cfg.toggle_pin(Path::new(r"D:\Dev\X"), Path::new(r"D:\Dev\X\Render.PNG")));
         assert!(cfg.is_pinned(Path::new(r"d:\dev\x\"), Path::new(r"d:\dev\x\render.png")));
