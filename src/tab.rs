@@ -94,6 +94,8 @@ pub struct Tab {
     /// What the library, watcher and scan were built with; changing it means `reopen`.
     pub recursive: bool,
     pub sort: SortOrder,
+    /// Single ungrouped list in recursive mode; no effect otherwise.
+    pub flat: bool,
     pub library: Library,
     pub gallery: Gallery,
     pub selection: Selection,
@@ -128,6 +130,7 @@ impl Tab {
             root,
             recursive: settings.recursive,
             sort: settings.sort,
+            flat: settings.flat,
             gallery: Gallery::new(),
             selection: Selection::default(),
             hovered: None,
@@ -155,6 +158,7 @@ impl Tab {
     pub fn reopen(&mut self, ctx: &Context, thumbs: &mut Thumbs, settings: FolderSettings) {
         self.recursive = settings.recursive;
         self.sort = settings.sort;
+        self.flat = settings.flat;
         self.library = Library::new(self.root.clone(), settings.recursive);
         self.selection.clear();
         self.order_snapshot.1.clear();
@@ -192,6 +196,7 @@ impl Tab {
 
     /// Selects `path` once the scan lists it; ignored when the folder is settled and lacks it.
     pub fn select_when_listed(&mut self, path: PathBuf) {
+        self.gallery.set_filter("");
         if self.scan.is_some() || self.library.get(&path).is_some() {
             self.pending_select = Some(path);
         }
@@ -619,7 +624,7 @@ mod tests {
     fn a_new_tab_takes_the_folder_settings_from_the_config() {
         let (_root, d) = dirs(1);
         let mut config = Config::default();
-        config.set_folder_settings(&d[0], FolderSettings { recursive: true, sort: SortOrder::NameAsc });
+        config.set_folder_settings(&d[0], FolderSettings { recursive: true, sort: SortOrder::NameAsc, flat: false });
         let mut window = WindowState::default();
         window.open_folder(&Context::default(), &config, d[0].clone());
         let tab = window.active_tab().unwrap();

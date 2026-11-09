@@ -1,4 +1,4 @@
-use eframe::egui::{ComboBox, Slider, Ui};
+use eframe::egui::{ComboBox, Slider, TextEdit, Ui};
 
 use crate::config::{Config, FolderSettings, MAX_SIZE, MIN_SIZE};
 use crate::layout::{BentoRule, LayoutKind};
@@ -31,7 +31,13 @@ fn rule_label(rule: BentoRule) -> &'static str {
 }
 
 /// `folder` holds the active tab's settings; its controls are disabled when no tab is open.
-pub fn show(ui: &mut Ui, config: &mut Config, folder: &mut FolderSettings, has_tab: bool) -> ToolbarEvents {
+pub fn show(
+    ui: &mut Ui,
+    config: &mut Config,
+    folder: &mut FolderSettings,
+    filter: &mut String,
+    has_tab: bool,
+) -> ToolbarEvents {
     let mut events = ToolbarEvents::default();
     ui.horizontal_wrapped(|ui| {
         if ui.button("Ouvrir").clicked() {
@@ -41,6 +47,10 @@ pub fn show(ui: &mut Ui, config: &mut Config, folder: &mut FolderSettings, has_t
             if ui.checkbox(&mut folder.recursive, "Récursif").changed() {
                 events.recursive_changed = true;
             }
+        });
+        ui.add_enabled_ui(has_tab && folder.recursive, |ui| {
+            ui.checkbox(&mut folder.flat, "À plat")
+                .on_hover_text("Une seule liste, sans regroupement par dossier");
         });
         ui.separator();
         for (kind, label, hint) in [
@@ -79,6 +89,18 @@ pub fn show(ui: &mut Ui, config: &mut Config, folder: &mut FolderSettings, has_t
             .step_by(1.0)
             .suffix(" px");
         events.config_changed |= ui.add(slider).changed();
+        ui.separator();
+        ui.add_enabled_ui(has_tab, |ui| {
+            ui.add(
+                TextEdit::singleline(filter)
+                    .id_salt("name_filter")
+                    .hint_text("Filtrer par nom…")
+                    .desired_width(140.0),
+            );
+            if !filter.is_empty() && ui.small_button("×").on_hover_text("Effacer le filtre").clicked() {
+                filter.clear();
+            }
+        });
     });
     events
 }

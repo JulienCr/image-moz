@@ -182,10 +182,12 @@ impl Library {
         self.entries.is_empty()
     }
 
-    pub fn sections(&self, sort: SortOrder) -> Vec<Section> {
+    /// Entries grouped by folder; a non-blank `filter` keeps names containing it, ignoring case.
+    pub fn sections(&self, sort: SortOrder, filter: &str, flat: bool) -> Vec<Section> {
+        let needle = filter.trim().to_lowercase();
         let mut groups: HashMap<&str, Vec<&Entry>> = HashMap::new();
-        for e in self.entries.values() {
-            groups.entry(e.rel_dir.as_str()).or_default().push(e);
+        for e in self.entries.values().filter(|e| needle.is_empty() || e.name.to_lowercase().contains(&needle)) {
+            groups.entry(if flat { "" } else { e.rel_dir.as_str() }).or_default().push(e);
         }
         let mut sections: Vec<(&str, Vec<&Entry>)> = groups.into_iter().collect();
         for (_, items) in &mut sections {
@@ -230,7 +232,7 @@ mod tests {
     }
 
     fn names(lib: &Library, sort: SortOrder) -> Vec<String> {
-        lib.sections(sort)
+        lib.sections(sort, "", false)
             .iter()
             .flat_map(|s| s.items.iter().map(|p| lib.get(p).unwrap().name.clone()))
             .collect()
@@ -299,13 +301,13 @@ mod tests {
         touch(&d.path().join("newer/n.png"), 5);
         let lib = lib_of(d.path(), true);
         let dirs: Vec<_> = lib
-            .sections(SortOrder::DateDesc)
+            .sections(SortOrder::DateDesc, "", false)
             .into_iter()
             .map(|s| s.rel_dir)
             .collect();
         assert_eq!(dirs, ["", "newer", "older"]);
         let dirs: Vec<_> = lib
-            .sections(SortOrder::NameAsc)
+            .sections(SortOrder::NameAsc, "", false)
             .into_iter()
             .map(|s| s.rel_dir)
             .collect();
@@ -323,9 +325,52 @@ mod tests {
         }
         for _ in 0..20 {
             let lib = lib_of(d.path(), true);
-            let dirs: Vec<_> = lib.sections(SortOrder::DateDesc).into_iter().map(|s| s.rel_dir).collect();
+            let dirs: Vec<_> = lib.sections(SortOrder::DateDesc, "", false).into_iter().map(|s| s.rel_dir).collect();
             assert_eq!(dirs, ["ALPHA2", "Beta", "alpha"]);
         }
+    }
+
+    #[test]
+    fn filter_matches_name_only_ignoring_case_and_empty_sections() {
+        let d = tempfile::tempdir().unwrap();
+        touch(&d.path().join("Cat.png"), 10);
+        touch(&d.path().join("dog.png"), 10);
+        touch(&d.path().join("cats/dog2.png"), 10);
+        touch(&d.path().join("birds/owl.png"), 10);
+        let lib = lib_of(d.path(), true);
+        let found = |q: &str| -> Vec<String> {
+            let mut v: Vec<_> = lib
+                .sections(SortOrder::NameAsc, q, false)
+                .iter()
+                .flat_map(|s| s.items.iter().map(|p| lib.get(p).unwrap().name.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(found("CAT"), ["Cat.png"]);
+        assert_eq!(found("  dog "), ["dog.png", "dog2.png"]);
+        assert_eq!(found("   ").len(), 4);
+        let dirs: Vec<_> = lib.sections(SortOrder::NameAsc, "owl", false).into_iter().map(|s| s.rel_dir).collect();
+        assert_eq!(dirs, ["birds"]);
+        assert!(lib.sections(SortOrder::NameAsc, "zzz", false).is_empty());
+    }
+
+    #[test]
+    fn flat_sections_merge_folders_in_one_sorted_list() {
+        let d = tempfile::tempdir().unwrap();
+        touch(&d.path().join("a/old.png"), 300);
+        touch(&d.path().join("b/mid.png"), 200);
+        touch(&d.path().join("a/new.png"), 100);
+        touch(&d.path().join("b/other.png"), 50);
+        let lib = lib_of(d.path(), true);
+        let flat = |q: &str| -> Vec<String> {
+            let sections = lib.sections(SortOrder::DateDesc, q, true);
+            assert!(sections.len() <= 1 && sections.iter().all(|s| s.rel_dir.is_empty()));
+            sections.iter().flat_map(|s| s.items.iter().map(|p| lib.get(p).unwrap().name.clone())).collect()
+        };
+        assert_eq!(flat(""), ["other.png", "new.png", "mid.png", "old.png"]);
+        assert_eq!(flat("o"), ["other.png", "old.png"]);
+        assert!(flat("zzz").is_empty());
     }
 
     #[test]

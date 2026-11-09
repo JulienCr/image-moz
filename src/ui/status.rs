@@ -58,6 +58,8 @@ pub struct StatusInfo<'a> {
     pub entry: Option<&'a Entry>,
     pub recursive: bool,
     pub total: usize,
+    /// Images matching the name filter; `None` when no filter is set.
+    pub matching: Option<usize>,
     pub selected: usize,
     pub loading: bool,
     /// Transient notice; replaces the entry summary while set.
@@ -69,7 +71,10 @@ pub fn show(ui: &mut Ui, info: &StatusInfo) {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(selected_text(info.selected));
             ui.separator();
-            ui.label(images_text(info.total));
+            match info.matching {
+                Some(n) => ui.label(format!("{n} / {}", images_text(info.total))),
+                None => ui.label(images_text(info.total)),
+            };
             ui.separator();
             if let Some(message) = info.message {
                 ui.add(Label::new(message).truncate());

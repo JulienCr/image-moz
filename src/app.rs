@@ -874,6 +874,10 @@ impl ImageMozApp {
         if settings.recursive != tab.recursive {
             tab.reopen(ctx, &mut self.thumbs, settings);
         }
+        if settings.flat != tab.flat {
+            tab.flat = settings.flat;
+            tab.gallery.scroll_to_top();
+        }
         tab.sort = settings.sort;
         if self.config.set_folder_settings(&tab.root, settings) {
             self.config_dirty = true;
@@ -907,6 +911,7 @@ impl ImageMozApp {
             config: &mut self.config,
             sort: tab.sort,
             recursive: tab.recursive,
+            flat: tab.recursive && tab.flat,
             root: &tab.root,
             selection: &tab.selection,
             scroll_to: tab.scroll_to.take(),
@@ -1026,15 +1031,23 @@ impl ImageMozApp {
         let previewing = win.active_tab().is_some_and(|t| t.preview.is_some());
         let mut settings = win
             .active_tab()
-            .map_or_else(FolderSettings::default, |t| FolderSettings { recursive: t.recursive, sort: t.sort });
+            .map_or_else(FolderSettings::default, |t| FolderSettings { recursive: t.recursive, sort: t.sort, flat: t.flat });
+        let mut filter = win.active_tab().map_or_else(String::new, |t| t.gallery.filter().to_owned());
         let has_tab = win.active_tab().is_some();
         let events = if previewing {
             toolbar::ToolbarEvents::default()
         } else {
             egui::Panel::top(Id::new(("toolbar", id)))
-                .show(ui, |ui| toolbar::show(ui, &mut self.config, &mut settings, has_tab))
+                .show(ui, |ui| toolbar::show(ui, &mut self.config, &mut settings, &mut filter, has_tab))
                 .inner
         };
+        if !previewing
+            && let Some(tab) = self.windows.state_mut(id).active_tab_mut()
+            && tab.gallery.filter() != filter
+        {
+            tab.gallery.set_filter(&filter);
+            ctx.request_repaint();
+        }
         let tab = self.windows.state(id).active_tab();
         let entry = tab.and_then(|tab| {
             tab.preview
@@ -1048,6 +1061,7 @@ impl ImageMozApp {
             entry,
             recursive: tab.is_some_and(|t| t.recursive),
             total: tab.map_or(0, |t| t.library.len()),
+            matching: tab.and_then(|t| t.gallery.match_count()),
             selected: tab.map_or(0, |t| t.selection.len()),
             loading: tab.is_some_and(Tab::is_scanning),
             message: self.toast.as_ref().filter(|t| t.window == id).map(|t| t.text.as_str()),

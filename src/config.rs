@@ -20,6 +20,7 @@ pub struct FolderState {
     pub collapsed: BTreeSet<String>,
     pub recursive: bool,
     pub sort: SortOrder,
+    pub flat: bool,
 }
 
 /// The per-folder view settings a tab edits from the toolbar.
@@ -27,6 +28,7 @@ pub struct FolderState {
 pub struct FolderSettings {
     pub recursive: bool,
     pub sort: SortOrder,
+    pub flat: bool,
 }
 
 /// Outer position and inner size of a window, in physical pixels.
@@ -181,7 +183,7 @@ impl Config {
 
     pub fn folder_settings(&self, folder: &Path) -> FolderSettings {
         self.folder(folder)
-            .map_or_else(FolderSettings::default, |s| FolderSettings { recursive: s.recursive, sort: s.sort })
+            .map_or_else(FolderSettings::default, |s| FolderSettings { recursive: s.recursive, sort: s.sort, flat: s.flat })
     }
 
     /// Returns true when the stored settings changed.
@@ -192,6 +194,7 @@ impl Config {
         let state = self.folder_mut(folder);
         state.recursive = settings.recursive;
         state.sort = settings.sort;
+        state.flat = settings.flat;
         true
     }
 
@@ -245,7 +248,7 @@ mod tests {
         cfg.session.active_window = 1;
         cfg.set_folder_settings(
             Path::new(r"D:\Pics"),
-            FolderSettings { recursive: true, sort: SortOrder::NameDesc },
+            FolderSettings { recursive: true, sort: SortOrder::NameDesc, flat: true },
         );
         cfg.toggle_pin(Path::new(r"D:\Pics"), Path::new(r"D:\Pics\a.png"));
         cfg.save(&path).unwrap();
@@ -297,7 +300,7 @@ mod tests {
         assert_eq!(cfg.session.windows, [expected]);
         assert_eq!(
             cfg.folder_settings(Path::new(r"D:\Pics")),
-            FolderSettings { recursive: true, sort: SortOrder::NameAsc }
+            FolderSettings { recursive: true, sort: SortOrder::NameAsc, flat: false }
         );
         assert_eq!(cfg.layout, LayoutKind::Justified);
         assert!(cfg.is_pinned(Path::new(r"D:\Pics"), Path::new(r"D:\Pics\a.png")));
@@ -334,7 +337,7 @@ mod tests {
     fn unseen_folder_gets_default_settings() {
         let mut cfg = Config::default();
         let folder = Path::new(r"D:\New");
-        assert_eq!(cfg.folder_settings(folder), FolderSettings { recursive: false, sort: SortOrder::DateDesc });
+        assert_eq!(cfg.folder_settings(folder), FolderSettings { recursive: false, sort: SortOrder::DateDesc, flat: false });
         assert!(cfg.set_folder_settings(folder, FolderSettings { recursive: true, ..Default::default() }));
         assert!(!cfg.set_folder_settings(folder, FolderSettings { recursive: true, ..Default::default() }));
         assert!(cfg.folder_settings(Path::new(r"d:\new\")).recursive);

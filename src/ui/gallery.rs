@@ -87,6 +87,7 @@ struct LayoutSig {
     rule: BentoRule,
     sort: SortOrder,
     recursive: bool,
+    flat: bool,
     pins: usize,
     collapsed: usize,
 }
@@ -109,6 +110,8 @@ pub struct View<'a> {
     pub config: &'a mut Config,
     pub sort: SortOrder,
     pub recursive: bool,
+    /// One ungrouped list; only meaningful with `recursive`.
+    pub flat: bool,
     pub root: &'a Path,
     pub selection: &'a Selection,
     /// Tile id to bring into view this frame.
@@ -180,7 +183,7 @@ pub struct Gallery {
     id: u64,
     lib_version: u64,
     dims_version: u64,
-    sections_key: Option<(u64, SortOrder, bool)>,
+    sections_key: Option<(u64, SortOrder, bool, bool)>,
     sections: Vec<Section>,
     sig: Option<LayoutSig>,
     last_layout: Instant,
@@ -196,6 +199,8 @@ pub struct Gallery {
     /// First visible tile and its y relative to the viewport top, from the previous frame.
     anchor: Option<(PathBuf, f32)>,
     reset_scroll: bool,
+    /// Name filter as typed; kept across `reset`.
+    filter: String,
     /// Bumped on every rebuild of `order`.
     order_version: u64,
 }
@@ -359,6 +364,7 @@ impl Gallery {
             viewport_h: 0.0,
             anchor: None,
             reset_scroll: false,
+            filter: String::new(),
             order_version: 0,
         }
     }
@@ -391,6 +397,32 @@ impl Gallery {
 
     pub fn order_version(&self) -> u64 {
         self.order_version
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.reset_scroll = true;
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Narrows the gallery to names containing `text` and returns the view to the top.
+    pub fn set_filter(&mut self, text: &str) {
+        if self.filter == text {
+            return;
+        }
+        self.filter = text.to_owned();
+        self.library_changed();
+        self.scroll_to_top();
+    }
+
+    /// Images matching the filter, across collapsed sections too; `None` when no filter is set.
+    pub fn match_count(&self) -> Option<usize> {
+        if self.filter.trim().is_empty() {
+            return None;
+        }
+        Some(self.sections.iter().map(|s| s.items.len()).sum())
     }
 
     /// Entries were added, removed or modified: sections and layout must be rebuilt.
@@ -464,6 +496,7 @@ impl Gallery {
             rule: cfg.bento_rule,
             sort: view.sort,
             recursive: view.recursive,
+            flat: view.flat,
             pins: state.map_or(0, |s| s.pins.len()),
             collapsed: state.map_or(0, |s| s.collapsed.len()),
         }
@@ -471,9 +504,9 @@ impl Gallery {
 
     fn rebuild(&mut self, view: &View, sig: &LayoutSig) {
         let cfg = &*view.config;
-        let sections_key = (sig.lib, sig.sort, sig.recursive);
+        let sections_key = (sig.lib, sig.sort, sig.recursive, sig.flat);
         if self.sections_key != Some(sections_key) {
-            self.sections = view.library.sections(view.sort);
+            self.sections = view.library.sections(view.sort, &self.filter, view.flat);
             self.sections_key = Some(sections_key);
         }
         let state = cfg.folder(view.root);
@@ -485,7 +518,7 @@ impl Gallery {
         let mut layout_sections = Vec::with_capacity(self.sections.len());
         for section in &self.sections {
             let key = collapse_key(&section.rel_dir);
-            let is_collapsed = view.recursive && collapsed.is_some_and(|c| c.contains(&key));
+            let is_collapsed = view.recursive && !view.flat && collapsed.is_some_and(|c| c.contains(&key));
             let mut items = Vec::new();
             if !is_collapsed {
                 for path in &section.items {
@@ -510,7 +543,7 @@ impl Gallery {
             }
             let label = if section.rel_dir.is_empty() { ".".to_string() } else { section.rel_dir.clone() };
             layout_sections.push(LayoutSection {
-                header: view.recursive.then(|| label.clone()),
+                header: (view.recursive && !view.flat).then(|| label.clone()),
                 collapsed: is_collapsed,
                 items,
             });
@@ -597,6 +630,16 @@ impl Gallery {
                 collapsed.insert(key);
             }
             out.config_changed = true;
+        }
+        if self.match_count() == Some(0) {
+            let color = ui.visuals().weak_text_color();
+            ui.painter().text(
+                scroll.inner_rect.center(),
+                Align2::CENTER_CENTER,
+                "Aucun fichier ne correspond au filtre",
+                FontId::proportional(14.0),
+                color,
+            );
         }
         out
     }
@@ -925,9 +968,70 @@ mod tests {
     }
 
     fn probe(thumbs: &mut Thumbs, gallery: &mut Gallery, library: &Library) {
-        gallery.sections = library.sections(SortOrder::default());
+        gallery.sections = library.sections(SortOrder::default(), "", false);
         gallery.library_changed();
         gallery.update_probes(thumbs, library);
+    }
+
+    fn show_once(
+        ctx: &Context,
+        thumbs: &mut Thumbs,
+        gallery: &mut Gallery,
+        library: &Library,
+        dir: &Path,
+        flat: bool,
+    ) {
+        let mut config = Config::default();
+        let selection = Selection::default();
+        let raw = eframe::egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(raw, |ui| {
+            let view = View {
+                library,
+                thumbs: &mut *thumbs,
+                config: &mut config,
+                sort: SortOrder::NameAsc,
+                recursive: true,
+                flat,
+                root: dir,
+                selection: &selection,
+                scroll_to: None,
+            };
+            gallery.show(ui, view);
+        });
+    }
+
+    #[test]
+    fn filter_and_flat_rebuild_the_layout_on_next_show() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["cat.png", "dog.png", "sub/cat2.png"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_image(&path);
+        }
+        let (ctx, mut thumbs, mut gallery) = test_thumbs(dir.path());
+        let mut library = Library::new(dir.path().to_path_buf(), true);
+        library.replace_all(crate::library::scan(dir.path(), true).unwrap());
+
+        show_once(&ctx, &mut thumbs, &mut gallery, &library, dir.path(), false);
+        assert_eq!(gallery.order().len(), 3);
+        assert_eq!(gallery.layout().headers.len(), 2);
+        assert_eq!(gallery.match_count(), None);
+
+        gallery.set_filter("CAT");
+        show_once(&ctx, &mut thumbs, &mut gallery, &library, dir.path(), false);
+        assert_eq!(gallery.order().len(), 2);
+        assert_eq!(gallery.match_count(), Some(2));
+
+        gallery.set_filter("");
+        show_once(&ctx, &mut thumbs, &mut gallery, &library, dir.path(), false);
+        assert_eq!(gallery.order().len(), 3);
+
+        show_once(&ctx, &mut thumbs, &mut gallery, &library, dir.path(), true);
+        assert_eq!(gallery.order().len(), 3);
+        assert!(gallery.layout().headers.is_empty());
     }
 
     /// Polls until `done` holds for the entry at `path`, or 5 s elapse.
