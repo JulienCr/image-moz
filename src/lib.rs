@@ -1,4 +1,5 @@
 pub mod app;
+pub mod blend;
 pub mod config;
 pub mod formats;
 pub mod geometry;
