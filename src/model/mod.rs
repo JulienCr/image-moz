@@ -1,5 +1,6 @@
 //! Renderable 3D scene shared by every model loader.
 
+pub mod camera;
 mod gltf;
 mod obj;
 mod stl;
