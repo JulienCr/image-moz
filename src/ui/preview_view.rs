@@ -86,7 +86,7 @@ fn show_model(ui: &mut Ui, response: &eframe::egui::Response, rect: Rect, state:
         let shift = ui.input(|i| i.modifiers.shift);
         let delta = response.drag_delta();
         if shift {
-            model.pan(delta, rect.height());
+            model.pan(delta, rect.size());
         } else {
             model.orbit(delta);
         }

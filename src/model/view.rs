@@ -125,8 +125,8 @@ impl ModelView {
         self.camera.orbit(glam::Vec2::new(d.x, d.y));
     }
 
-    pub fn pan(&mut self, d: Vec2, h: f32) {
-        self.camera.pan(glam::Vec2::new(d.x, d.y), h);
+    pub fn pan(&mut self, d: Vec2, viewport: Vec2) {
+        self.camera.pan(glam::Vec2::new(d.x, d.y), glam::Vec2::new(viewport.x, viewport.y));
     }
 
     pub fn dolly(&mut self, notches: f32) {
@@ -259,7 +259,7 @@ mod tests {
         let mut view = ModelView::new(scene, &path).unwrap();
         assert_eq!(*view.camera(), initial);
         view.orbit(vec2(40.0, -15.0));
-        view.pan(vec2(10.0, 5.0), 600.0);
+        view.pan(vec2(10.0, 5.0), vec2(800.0, 600.0));
         view.dolly(3.0);
         assert_ne!(*view.camera(), initial);
         view.reset();

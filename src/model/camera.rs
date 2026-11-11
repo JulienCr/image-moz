@@ -108,6 +108,18 @@ impl OrbitCamera {
         self.target + (up * sp + (right * sy + back * cy) * cp) * self.distance
     }
 
+    /// Viewport aspect (sanitised) and the vertical FOV it is drawn with: narrower viewports
+    /// than the fit aspect keep the horizontal field of view.
+    fn effective_view(&self, aspect: f32) -> (f32, f32) {
+        let aspect = if aspect.is_finite() && aspect > 1e-3 { aspect } else { 1.0 };
+        let yfov = if aspect < self.fit_aspect {
+            2.0 * ((self.yfov * 0.5).tan() * self.fit_aspect / aspect).atan()
+        } else {
+            self.yfov
+        };
+        (aspect, yfov)
+    }
+
     /// Right-handed, depth 0..1; near/far hug the bounds so depth precision holds.
     pub fn view_proj(&self, aspect: f32, bounds: &Aabb) -> Mat4 {
         let eye = self.eye();
@@ -115,18 +127,8 @@ impl OrbitCamera {
         let radius = effective_radius(bounds);
         let far = ((to_center + radius).max(self.distance + radius) * FRAMING_MARGIN).max(1e-3);
         let near = (to_center - radius).max(far * 1e-3);
-        let aspect = if aspect.is_finite() && aspect > 1e-3 {
-            aspect
-        } else {
-            1.0
-        };
+        let (aspect, yfov) = self.effective_view(aspect);
         let (_, up, _) = basis(self.up);
-        // Keep the horizontal field of view when the viewport is narrower than the fit aspect.
-        let yfov = if aspect < self.fit_aspect {
-            2.0 * ((self.yfov * 0.5).tan() * self.fit_aspect / aspect).atan()
-        } else {
-            self.yfov
-        };
         rh::proj::directx::perspective(yfov, aspect, near, far)
             * rh::view::look_at_mat4(eye, self.target, up)
     }
@@ -136,12 +138,14 @@ impl OrbitCamera {
         self.pitch = (self.pitch + delta.y * ORBIT_RAD_PER_POINT).clamp(-MAX_PITCH, MAX_PITCH);
     }
 
-    pub fn pan(&mut self, delta: Vec2, viewport_height: f32) {
+    /// Moves the target so the scene follows a drag of `delta` points across a `viewport` of points.
+    pub fn pan(&mut self, delta: Vec2, viewport: Vec2) {
         let forward = (self.target - self.eye()).normalize_or_zero();
         let (_, up, _) = basis(self.up);
         let right = forward.cross(up).normalize_or_zero();
         let cam_up = right.cross(forward);
-        let per_point = 2.0 * self.distance * (self.yfov * 0.5).tan() / viewport_height.max(1.0);
+        let (_, yfov) = self.effective_view(viewport.x / viewport.y.max(1.0));
+        let per_point = 2.0 * self.distance * (yfov * 0.5).tan() / viewport.y.max(1.0);
         self.target += (-right * delta.x + cam_up * delta.y) * per_point;
     }
 
@@ -329,11 +333,30 @@ mod tests {
         let before = o.view_proj(1.0, &b);
         let t0 = o.target;
         let p0 = ndc(before, t0);
-        o.pan(Vec2::new(10.0, 0.0), 100.0);
+        o.pan(Vec2::new(10.0, 0.0), Vec2::splat(100.0));
         // The old target point must now sit further right on screen.
         let p1 = ndc(o.view_proj(1.0, &b), t0);
         assert!(p1.x > p0.x);
         assert!((p1.y - p0.y).abs() < 1e-4);
+    }
+
+    #[test]
+    fn pan_follows_the_cursor_under_a_widened_fov() {
+        let cam = SceneCamera {
+            eye: Vec3::new(0.0, 0.0, 10.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            yfov: 0.6,
+            aspect: Some(16.0 / 9.0),
+        };
+        let b = bx();
+        let mut o = OrbitCamera::from_scene(&cam, &b, UpAxis::Y);
+        let t0 = o.target;
+        let before = ndc(o.view_proj(1.0, &b), t0);
+        o.pan(Vec2::new(0.0, 100.0), Vec2::splat(100.0));
+        let after = ndc(o.view_proj(1.0, &b), t0);
+        assert!((before.y - after.y - 2.0).abs() < 1e-3, "{before} -> {after}");
+        assert!((before.x - after.x).abs() < 1e-3);
     }
 
     #[test]
