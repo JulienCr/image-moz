@@ -74,7 +74,7 @@ impl OrbitCamera {
         let horizontal = back_dir - up_v * back_dir.dot(up_v);
         let yaw = horizontal.dot(right).atan2(horizontal.dot(back));
         let mut t = (bounds.center() - cam.eye).dot(forward);
-        if !(t > 0.0) {
+        if t.is_nan() || t <= 0.0 {
             t = effective_radius(bounds);
         }
         Self {

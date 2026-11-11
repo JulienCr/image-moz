@@ -233,7 +233,7 @@ mod tests {
         let mut bin = b[bin_start..].to_vec();
         edit(&mut json, &mut bin);
         let mut j = serde_json::to_vec(&json).unwrap();
-        while j.len() % 4 != 0 {
+        while !j.len().is_multiple_of(4) {
             j.push(b' ');
         }
         let mut out = b"glTF".to_vec();
