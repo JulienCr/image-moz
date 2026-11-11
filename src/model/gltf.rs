@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use glam::{Mat3, Mat4, Vec3};
@@ -49,15 +50,15 @@ pub(super) fn load_gltf(path: &Path) -> Result<Scene, ModelError> {
     };
     let mut default_material = None;
 
-    let gltf_scene = doc.default_scene().or_else(|| doc.scenes().next());
-    let mut stack: Vec<(::gltf::Node, Mat4)> = gltf_scene
-        .into_iter()
-        .flat_map(|s| s.nodes().collect::<Vec<_>>())
-        .rev()
-        .map(|n| (n, Mat4::IDENTITY))
-        .collect();
+    let mut stack: Vec<(::gltf::Node, Mat4)> =
+        root_nodes(&doc).into_iter().rev().map(|n| (n, Mat4::IDENTITY)).collect();
+    // gltf does not validate the hierarchy: a node reached twice is a cycle (or a second parent).
+    let mut visited = vec![false; doc.nodes().len()];
     // Popping from a stack visits nodes depth-first in document order.
     while let Some((node, parent)) = stack.pop() {
+        if std::mem::replace(&mut visited[node.index()], true) {
+            return Err(ModelError::Parse("node cycle".into()));
+        }
         let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
         if scene.camera.is_none() {
             scene.camera = node.camera().and_then(|c| camera_at(&c, &world));
@@ -84,6 +85,15 @@ pub(super) fn load_gltf(path: &Path) -> Result<Scene, ModelError> {
     scene.materials = materials;
     scene.fill_missing_normals();
     Ok(scene)
+}
+
+/// Nodes of the default scene; without any scene, the nodes that are nobody's child.
+fn root_nodes(doc: &::gltf::Document) -> Vec<::gltf::Node<'_>> {
+    if let Some(scene) = doc.default_scene().or_else(|| doc.scenes().next()) {
+        return scene.nodes().collect();
+    }
+    let children: HashSet<usize> = doc.nodes().flat_map(|n| n.children().map(|c| c.index())).collect();
+    doc.nodes().filter(|n| !children.contains(&n.index())).collect()
 }
 
 fn camera_at(camera: &::gltf::Camera, world: &Mat4) -> Option<SceneCamera> {
@@ -278,6 +288,27 @@ mod tests {
         let s = load(&p).unwrap();
         assert!(s.camera.is_none());
         assert_eq!(s.triangle_count(), 12);
+    }
+
+    #[test]
+    fn node_listing_itself_as_child_is_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = patched_glb(dir.path(), |json, _| {
+            let root = json["scenes"][0]["nodes"][0].as_u64().unwrap() as usize;
+            json["nodes"][root]["children"] = serde_json::json!([root]);
+        });
+        assert!(matches!(load(&p), Err(ModelError::Parse(m)) if m == "node cycle"));
+    }
+
+    #[test]
+    fn glb_without_scenes_falls_back_to_root_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = patched_glb(dir.path(), |json, _| {
+            let json = json.as_object_mut().unwrap();
+            json.remove("scenes");
+            json.remove("scene");
+        });
+        assert_eq!(load(&p).unwrap().triangle_count(), 12);
     }
 
     #[test]
