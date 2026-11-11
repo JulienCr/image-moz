@@ -8,27 +8,51 @@ use glam::{Mat4, Vec3};
 use super::{DEFAULT_COLOR, Material, ModelError, Primitive, Scene, UpAxis, Vertex};
 
 const MAX_COMPONENT_DEPTH: usize = 16;
+/// Ceiling on component visits plus instantiated mesh vertices, so a fan-out cannot exhaust memory.
+const MAX_INSTANCE_COST: usize = 20_000_000;
 
 struct Builder<'a> {
     objects: HashMap<usize, &'a threemf::model::Object>,
     scene: Scene,
 }
 
-impl Builder<'_> {
-    fn add_object(&mut self, id: usize, transform: Mat4, depth: usize) -> Result<(), ModelError> {
+/// Cost of an object at a nesting depth, shared by every path that reaches it.
+type CostMemo = HashMap<(usize, usize), usize>;
+
+impl<'a> Builder<'a> {
+    /// Visits plus mesh vertices an object expands to, without instantiating anything.
+    fn cost(&self, id: usize, depth: usize, memo: &mut CostMemo) -> Result<usize, ModelError> {
         if depth > MAX_COMPONENT_DEPTH {
             return Err(ModelError::Parse("3MF components nested too deeply".into()));
         }
-        let object = *self
-            .objects
+        if let Some(&known) = memo.get(&(id, depth)) {
+            return Ok(known);
+        }
+        let object = self.object(id)?;
+        let mut total = 1 + object.mesh.as_ref().map_or(0, |m| m.vertices.vertex.len());
+        for c in object.components.iter().flat_map(|c| &c.component) {
+            total = total.saturating_add(self.cost(c.objectid, depth + 1, memo)?);
+        }
+        memo.insert((id, depth), total);
+        Ok(total)
+    }
+
+    fn object(&self, id: usize) -> Result<&'a threemf::model::Object, ModelError> {
+        self.objects
             .get(&id)
-            .ok_or_else(|| ModelError::Parse(format!("3MF references missing object {id}")))?;
+            .copied()
+            .ok_or_else(|| ModelError::Parse(format!("3MF references missing object {id}")))
+    }
+
+    /// Callers have checked the depth and cost with `cost`.
+    fn add_object(&mut self, id: usize, transform: Mat4) -> Result<(), ModelError> {
+        let object = self.object(id)?;
         if let Some(mesh) = &object.mesh {
             self.add_mesh(mesh, transform)?;
         }
         for c in object.components.iter().flat_map(|c| &c.component) {
             let local = c.transform.map_or(Mat4::IDENTITY, matrix);
-            self.add_object(c.objectid, transform * local, depth + 1)?;
+            self.add_object(c.objectid, transform * local)?;
         }
         Ok(())
     }
@@ -112,10 +136,19 @@ pub(super) fn load_3mf(path: &Path) -> Result<Scene, ModelError> {
             builder.objects.insert(object.id, object);
         }
     }
+    let (mut memo, mut total) = (CostMemo::new(), 0usize);
+    for model in &models {
+        for item in &model.build.item {
+            total = total.saturating_add(builder.cost(item.objectid, 0, &mut memo)?);
+        }
+    }
+    if total > MAX_INSTANCE_COST {
+        return Err(ModelError::Parse("3MF expands to too much geometry".into()));
+    }
     for model in &models {
         for item in &model.build.item {
             let transform = item.transform.map_or(Mat4::IDENTITY, matrix);
-            builder.add_object(item.objectid, transform, 0)?;
+            builder.add_object(item.objectid, transform)?;
         }
     }
 
@@ -167,6 +200,64 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
         assert!(load_3mf(&path).is_err());
+    }
+
+    /// A chain of `levels` objects, each listing the next `fan_out` times; the last holds a mesh.
+    fn nested_model(levels: usize, fan_out: usize) -> threemf::model::Model {
+        let mut model = threemf::model::Model::from(triangle_mesh());
+        let leaf = model.resources.object.pop().unwrap();
+        let object = |id, components: Vec<usize>| threemf::model::Object {
+            id,
+            partnumber: None,
+            name: None,
+            pid: None,
+            pindex: None,
+            mesh: None,
+            components: Some(threemf::model::Components {
+                component: components
+                    .into_iter()
+                    .map(|objectid| threemf::model::Component { objectid, transform: None })
+                    .collect(),
+            }),
+        };
+        let leaf_id = levels + 1;
+        for id in 1..=levels {
+            model.resources.object.push(object(id, vec![id + 1; fan_out]));
+        }
+        model.resources.object.push(threemf::model::Object { id: leaf_id, ..leaf });
+        model.build.item[0].objectid = 1;
+        model
+    }
+
+    fn write_model(dir: &Path, model: threemf::model::Model) -> std::path::PathBuf {
+        let path = dir.join("t.3mf");
+        threemf::write(File::create(&path).unwrap(), model).unwrap();
+        path
+    }
+
+    #[test]
+    fn moderate_nesting_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let scene = load_3mf(&write_model(dir.path(), nested_model(4, 2))).unwrap();
+        assert_eq!(scene.triangle_count(), 16);
+    }
+
+    #[test]
+    fn exponential_fan_out_is_a_parse_error_without_instantiating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_model(dir.path(), nested_model(MAX_COMPONENT_DEPTH, 4));
+        let start = std::time::Instant::now();
+        assert!(matches!(load_3mf(&path), Err(ModelError::Parse(m)) if m.contains("too much geometry")));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn component_cycle_is_a_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut model = nested_model(1, 1);
+        model.resources.object[1].mesh = None;
+        model.resources.object[0].components.as_mut().unwrap().component[0].objectid = 1;
+        assert!(matches!(load_3mf(&write_model(dir.path(), model)), Err(ModelError::Parse(_))));
     }
 
     #[test]
