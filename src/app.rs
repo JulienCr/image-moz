@@ -816,7 +816,7 @@ impl ImageMozApp {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let wake = wake(ctx);
         std::thread::spawn(move || {
-            let _ = tx.send(formats::decode(&focus));
+            let _ = tx.send(formats::decode(&focus).map(|d| d.image));
             wake();
         });
         self.pending_copy = Some(PendingCopy { window: self.cur, files, decoded: rx });

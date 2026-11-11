@@ -17,6 +17,10 @@ pub struct Entry {
     pub mtime: SystemTime,
     pub size: u64,
     pub dims: Option<(u32, u32)>,
+    /// Triangle count of a 3D model, once its thumbnail has been made.
+    pub triangles: Option<u32>,
+    /// The file is valid but has no preview to draw (a `.blend` without thumbnail).
+    pub no_preview: bool,
     pub error: bool,
     pub arrived_at: Option<Instant>,
 }
@@ -77,6 +81,8 @@ fn make_entry(path: &Path, rel_dir: String) -> Option<Entry> {
         mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         size: meta.len(),
         dims: None,
+        triangles: None,
+        no_preview: false,
         error: false,
         arrived_at: None,
     })
@@ -144,6 +150,8 @@ impl Library {
                         e.size = m.len();
                     }
                     e.dims = None;
+                    e.triangles = None;
+                    e.no_preview = false;
                     e.error = false;
                     return false;
                 }

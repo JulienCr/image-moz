@@ -10,6 +10,7 @@ use eframe::egui::{
 };
 
 use super::status;
+use crate::formats;
 use crate::config::{self, Config};
 use crate::layout::{self, BentoRule, Layout, LayoutItem, LayoutKind, LayoutSection};
 use crate::library::{Entry, FsChange, Library, Section, SortOrder};
@@ -223,6 +224,18 @@ fn fit(rect: Rect, size: Vec2) -> Rect {
     Rect::from_center_size(rect.center(), size * scale)
 }
 
+/// Format label at the bottom-left corner of a tile.
+fn draw_badge(painter: &egui::Painter, tile: Rect, label: &str) {
+    const PAD: f32 = 3.0;
+    let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(10.0), Color32::WHITE);
+    let rect = Rect::from_min_size(
+        pos2(tile.left() + 4.0, tile.bottom() - 4.0 - galley.size().y - 2.0 * PAD),
+        galley.size() + vec2(2.0 * PAD, 2.0 * PAD),
+    );
+    painter.rect_filled(rect, CornerRadius::same(3), Color32::from_black_alpha(160));
+    painter.galley(rect.min + vec2(PAD, PAD), galley, Color32::WHITE);
+}
+
 /// Scroll offset that puts the anchor tile back at its previous on-screen y.
 fn anchored_offset(new_tile_y: f32, screen_y: f32, content_h: f32, viewport_h: f32) -> f32 {
     (new_tile_y - screen_y).clamp(0.0, (content_h - viewport_h).max(0.0))
@@ -305,11 +318,17 @@ impl Thumbs {
                 let dims = match &result.outcome {
                     ThumbOutcome::Ready(thumb) => {
                         entry.error = false;
+                        entry.no_preview = false;
+                        entry.triangles = thumb.triangles;
                         Some(thumb.orig_dims)
                     }
                     ThumbOutcome::Dims(dims) => Some(*dims),
                     ThumbOutcome::Failed => {
                         entry.error = true;
+                        None
+                    }
+                    ThumbOutcome::NoPreview => {
+                        entry.no_preview = true;
                         None
                     }
                 };
@@ -571,6 +590,7 @@ impl Gallery {
             if let Some(e) = library.get(path)
                 && e.dims.is_none()
                 && !e.error
+                && !e.no_preview
             {
                 jobs.push(ThumbJob { path: path.clone(), key: key_for(path, e.mtime, e.size) });
             }
@@ -724,7 +744,7 @@ impl Gallery {
             let entry = view.library.get(path);
             let in_view = rel.intersects(viewport);
             let loaded = view.thumbs.textures.contains(key);
-            if !loaded && !entry.is_some_and(|e| e.error) {
+            if !loaded && !entry.is_some_and(|e| e.error || e.no_preview) {
                 let job = ThumbJob { path: path.clone(), key };
                 if in_view {
                     near_jobs.push(job);
@@ -756,6 +776,17 @@ impl Gallery {
                     FontId::proportional(28.0),
                     Color32::from_rgb(230, 160, 40),
                 );
+            } else if entry.is_some_and(|e| e.no_preview) {
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "pas d'aperçu",
+                    FontId::proportional(13.0),
+                    ui.visuals().weak_text_color(),
+                );
+            }
+            if let Some(label) = formats::badge(path) {
+                draw_badge(painter, rect, label);
             }
             let accent = Color32::from_rgb(70, 140, 255);
             if view.selection.contains(id) {

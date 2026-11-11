@@ -80,7 +80,7 @@ impl PreviewState {
         let (tx, rx) = crossbeam_channel::unbounded();
         let wake_ctx = ctx.clone();
         let worker = Worker::spawn(
-            |path| formats::decode(path).map_err(|e| e.to_string()),
+            |path| formats::decode(path).map(|d| d.image).map_err(|e| e.to_string()),
             tx,
             Box::new(move || wake_ctx.request_repaint()),
         );

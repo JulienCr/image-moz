@@ -6,8 +6,9 @@ use std::time::SystemTime;
 
 use super::{Thumb, ThumbKey};
 
-const MAGIC: &[u8; 4] = b"IMZ1";
-const HEADER_LEN: usize = 12;
+const MAGIC: &[u8; 4] = b"IMZ2";
+const HEADER_LEN: usize = 16;
+const NO_TRIANGLES: u32 = u32::MAX;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -51,6 +52,7 @@ impl DiskCache {
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&thumb.orig_dims.0.to_le_bytes());
         bytes.extend_from_slice(&thumb.orig_dims.1.to_le_bytes());
+        bytes.extend_from_slice(&thumb.triangles.unwrap_or(NO_TRIANGLES).to_le_bytes());
         let mut qoi = Cursor::new(Vec::new());
         thumb
             .image
@@ -104,12 +106,14 @@ fn decode(bytes: &[u8]) -> Option<Thumb> {
     }
     let w = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
     let h = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let triangles = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
     let image = image::load_from_memory_with_format(&bytes[HEADER_LEN..], image::ImageFormat::Qoi)
         .ok()?
         .to_rgba8();
     Some(Thumb {
         image,
         orig_dims: (w, h),
+        triangles: (triangles != NO_TRIANGLES).then_some(triangles),
     })
 }
 
@@ -125,6 +129,7 @@ mod tests {
         Thumb {
             image,
             orig_dims: (w * 4, h * 4),
+            triangles: None,
         }
     }
 
@@ -165,6 +170,31 @@ mod tests {
         let got = cache.get(key).unwrap();
         assert_eq!(got.image, t.image);
         assert_eq!(got.orig_dims, t.orig_dims);
+    }
+
+    #[test]
+    fn cache_roundtrips_triangles() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(dir.path().to_path_buf()).unwrap();
+        let mut t = thumb(8, 8);
+        t.triangles = Some(7);
+        cache.put(ThumbKey(1), &t).unwrap();
+        assert_eq!(cache.get(ThumbKey(1)).unwrap().triangles, Some(7));
+        t.triangles = None;
+        cache.put(ThumbKey(2), &t).unwrap();
+        assert_eq!(cache.get(ThumbKey(2)).unwrap().triangles, None);
+    }
+
+    #[test]
+    fn old_cache_format_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(dir.path().to_path_buf()).unwrap();
+        cache.put(ThumbKey(1), &thumb(8, 8)).unwrap();
+        let path = cache.path_for(ThumbKey(1));
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[..4].copy_from_slice(b"IMZ1");
+        fs::write(&path, bytes).unwrap();
+        assert!(cache.get(ThumbKey(1)).is_none());
     }
 
     #[test]

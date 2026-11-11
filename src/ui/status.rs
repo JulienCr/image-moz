@@ -1,5 +1,6 @@
 use eframe::egui::{self, Align, Label, Layout, Ui};
 
+use crate::formats::{self, MediaKind};
 use crate::library::Entry;
 
 /// French size text with a decimal comma: `1,5 Ko`, `12,0 Mo`.
@@ -18,10 +19,29 @@ pub fn format_size(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit]).replace('.', ",")
 }
 
+/// `12 345 triangles` with a narrow no-break space between thousands.
+pub fn triangles_text(count: Option<u32>) -> String {
+    let Some(n) = count else { return "? triangles".to_string() };
+    let digits = n.to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push('\u{202F}');
+        }
+        grouped.push(c);
+    }
+    format!("{grouped} triangle{}", if n == 1 { "" } else { "s" })
+}
+
+/// Empty for `.blend` files, whose size says nothing about the scene.
 pub fn dims_text(entry: &Entry) -> String {
-    match entry.dims {
-        Some((w, h)) => format!("{w} × {h}"),
-        None => "? × ?".to_string(),
+    match formats::kind(&entry.path) {
+        Some(MediaKind::Model) => triangles_text(entry.triangles),
+        Some(MediaKind::Blend) => String::new(),
+        _ => match entry.dims {
+            Some((w, h)) => format!("{w} × {h}"),
+            None => "? × ?".to_string(),
+        },
     }
 }
 
@@ -32,7 +52,12 @@ pub fn rel_dir_label(entry: &Entry) -> &str {
 
 /// Dimensions and size on one line, shared by the tooltip and the status bar.
 pub fn meta_text(entry: &Entry) -> String {
-    format!("{}  ·  {}", dims_text(entry), format_size(entry.size))
+    let dims = dims_text(entry);
+    if dims.is_empty() {
+        format_size(entry.size)
+    } else {
+        format!("{dims}  ·  {}", format_size(entry.size))
+    }
 }
 
 pub fn summary(entry: &Entry, recursive: bool) -> String {
@@ -101,6 +126,8 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH,
             size,
             dims,
+            triangles: None,
+            no_preview: false,
             error: false,
             arrived_at: None,
         }
@@ -124,6 +151,29 @@ mod tests {
         assert_eq!(summary(&e, true), "a.png  ·  640 × 480  ·  2,0 Ko  ·  .");
         let e = entry(10, None, "sub/deep");
         assert_eq!(summary(&e, true), "a.png  ·  ? × ?  ·  10 o  ·  sub/deep");
+    }
+
+    #[test]
+    fn triangle_text() {
+        assert_eq!(triangles_text(Some(12345)), "12\u{202F}345 triangles");
+        assert_eq!(triangles_text(Some(1)), "1 triangle");
+        assert_eq!(triangles_text(None), "? triangles");
+    }
+
+    #[test]
+    fn blend_meta_has_no_dims() {
+        let mut e = entry(2048, None, "");
+        e.name = "a.blend".to_string();
+        e.path = PathBuf::from("a.blend");
+        assert_eq!(meta_text(&e), "2,0 Ko");
+    }
+
+    #[test]
+    fn model_meta_shows_triangles() {
+        let mut e = entry(2048, Some((1024, 1024)), "");
+        e.path = PathBuf::from("a.glb");
+        e.triangles = Some(12);
+        assert_eq!(meta_text(&e), "12 triangles  ·  2,0 Ko");
     }
 
     #[test]
