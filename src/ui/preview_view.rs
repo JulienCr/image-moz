@@ -1,9 +1,12 @@
+use std::path::Path;
+
 use eframe::egui::{
     Align2, Color32, CursorIcon, Event, FontId, MouseWheelUnit, PointerButton, Rect, Sense, TextureHandle, Ui, Vec2,
     pos2,
 };
 use eframe::egui_wgpu::RenderState;
 
+use crate::formats::{self, MediaKind};
 use crate::model::gpu::ModelRenderer;
 use crate::preview::{PreviewState, ViewTransform};
 
@@ -25,7 +28,7 @@ pub fn show(ui: &mut Ui, state: &mut PreviewState, thumb: Option<&TextureHandle>
 
     let texture = state.image.as_ref().or(thumb);
     if let Some(message) = &state.error {
-        let text = format!("Image illisible : {message}");
+        let text = error_text(&state.path, message);
         painter.text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(16.0), Color32::GRAY);
         return;
     }
@@ -63,6 +66,11 @@ pub fn show(ui: &mut Ui, state: &mut PreviewState, thumb: Option<&TextureHandle>
         let pos = rect.center_bottom() - Vec2::new(0.0, 24.0);
         painter.text(pos, Align2::CENTER_CENTER, "Chargement…", FontId::proportional(14.0), Color32::GRAY);
     }
+}
+
+fn error_text(path: &Path, message: &str) -> String {
+    let what = if formats::kind(path) == Some(MediaKind::Model) { "Modèle" } else { "Image" };
+    format!("{what} illisible : {message}")
 }
 
 /// Middle drag orbits, Shift + middle drag pans, the wheel dollies; the left button does nothing.
@@ -119,6 +127,12 @@ mod tests {
 
     fn wheel(unit: MouseWheelUnit, y: f32) -> Event {
         Event::MouseWheel { unit, delta: vec2(0.0, y), phase: TouchPhase::Move, modifiers: Modifiers::NONE }
+    }
+
+    #[test]
+    fn error_text_names_what_could_not_be_read() {
+        assert_eq!(error_text(Path::new("a.glb"), "bad"), "Modèle illisible : bad");
+        assert_eq!(error_text(Path::new("a.png"), "bad"), "Image illisible : bad");
     }
 
     #[test]
