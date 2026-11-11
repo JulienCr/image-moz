@@ -556,11 +556,3 @@ pub fn try_read_back(
     buffer.unmap();
     RgbaImage::from_raw(width, height, pixels).ok_or_else(|| "readback size mismatch".into())
 }
-
-/// Infallible form of `try_read_back`: a failure is logged and yields a transparent image.
-pub fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> RgbaImage {
-    try_read_back(device, queue, texture).unwrap_or_else(|e| {
-        log::error!("model readback failed: {e}");
-        RgbaImage::new(texture.width(), texture.height())
-    })
-}
