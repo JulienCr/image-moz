@@ -13,6 +13,7 @@ use super::camera::OrbitCamera;
 use super::{Aabb, DEFAULT_COLOR, Material, Scene, Vertex};
 
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+pub const GAMMA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SAMPLE_COUNT: u32 = 4;
 const READBACK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -430,7 +431,7 @@ impl RenderTarget {
             height: size[1],
             depth_or_array_layers: 1,
         };
-        let make = |label, format, sample_count, usage| {
+        let make = |label, format, sample_count, usage, view_formats: &[wgpu::TextureFormat]| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: extent,
@@ -439,18 +440,19 @@ impl RenderTarget {
                 dimension: wgpu::TextureDimension::D2,
                 format,
                 usage,
-                view_formats: &[],
+                view_formats,
             })
         };
         let attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
-        let msaa = make("model msaa color", COLOR_FORMAT, SAMPLE_COUNT, attachment);
-        let depth = make("model depth", DEPTH_FORMAT, SAMPLE_COUNT, attachment);
+        let msaa = make("model msaa color", COLOR_FORMAT, SAMPLE_COUNT, attachment, &[]);
+        let depth = make("model depth", DEPTH_FORMAT, SAMPLE_COUNT, attachment, &[]);
         let resolve = make(
             "model resolved color",
             COLOR_FORMAT,
             1,
             attachment | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            &[GAMMA_FORMAT],
         );
         Self {
             size,
@@ -472,6 +474,14 @@ impl RenderTarget {
 
     pub fn view(&self) -> &wgpu::TextureView {
         &self.resolve_view
+    }
+
+    /// The resolved texture read as raw sRGB bytes, the form egui samples user textures in.
+    pub fn gamma_view(&self) -> wgpu::TextureView {
+        self.resolve.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(GAMMA_FORMAT),
+            ..Default::default()
+        })
     }
 }
 

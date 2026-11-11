@@ -8,6 +8,7 @@ use eframe::egui::{
     self, Color32, Context, CornerRadius, Frame, IconData, Id, Key, Margin, Modifiers, Pos2, Rect, ViewportBuilder,
     ViewportCommand, ViewportId, pos2, vec2,
 };
+use eframe::egui_wgpu::RenderState;
 use image::RgbaImage;
 
 use crate::config::{Config, FolderSettings, MAX_SIZE, MIN_SIZE, WindowBounds};
@@ -15,6 +16,8 @@ use crate::formats::{self, DecodeError};
 use crate::geometry::{self, BarGeometry, Fitted, PxRect};
 use crate::instance::Primary;
 use crate::layout::{Dir, LayoutKind};
+use crate::model::gpu::ModelRenderer;
+use crate::model::offscreen::build_renderer;
 use crate::platform;
 use crate::tab::{FolderIssue, OpenTarget, Tab, WindowState, absolute, wake};
 use crate::ui::gallery::{self, Thumbs};
@@ -76,6 +79,7 @@ enum PreviewAction {
     Close,
     Step(isize),
     Refit,
+    ToggleUp,
     CopyFiles,
     CopyPaths,
 }
@@ -137,6 +141,9 @@ pub struct ImageMozApp {
     /// Window to bring forward after a restore, while the OS hands the focus to the last one created.
     restore_focus: Option<(WindowId, Instant)>,
     restore_raised: bool,
+    /// eframe's wgpu state and the model pipeline built on its device; models cannot be drawn without both.
+    render_state: Option<RenderState>,
+    model_renderer: Option<ModelRenderer>,
 }
 
 /// Everything decided before the first window exists: the session to restore and the root's placement.
@@ -266,6 +273,14 @@ impl ImageMozApp {
         if let Some(id) = restore_focus {
             windows.touch(id);
         }
+        let render_state = cc.wgpu_render_state.clone();
+        let model_renderer = render_state.as_ref().and_then(|rs| match build_renderer(&rs.device) {
+            Ok(renderer) => Some(renderer),
+            Err(e) => {
+                log::error!("3D preview unavailable: {e}");
+                None
+            }
+        });
         let config_path = Config::default_path();
         let mut app = Self {
             config,
@@ -287,6 +302,8 @@ impl ImageMozApp {
             published_target: 0,
             restore_focus: restore_focus.map(|id| (id, Instant::now())),
             restore_raised: false,
+            render_state,
+            model_renderer,
         };
         if let Some(target) = cli {
             let dest = app.windows.last_active();
@@ -755,6 +772,8 @@ impl ImageMozApp {
                 Some(PreviewAction::Step(1))
             } else if i.key_pressed(Key::Num0) {
                 Some(PreviewAction::Refit)
+            } else if i.key_pressed(Key::U) && fresh_press(i, Key::U) {
+                Some(PreviewAction::ToggleUp)
             } else {
                 None
             }
@@ -769,7 +788,15 @@ impl ImageMozApp {
                     PreviewAction::Step(delta) => tab.step_preview(ctx, delta),
                     PreviewAction::Refit => {
                         if let Some(preview) = &mut tab.preview {
-                            preview.fitted = true;
+                            match &mut preview.model {
+                                Some(model) => model.reset(),
+                                None => preview.fitted = true,
+                            }
+                        }
+                    }
+                    PreviewAction::ToggleUp => {
+                        if let Some(model) = tab.preview.as_mut().and_then(|p| p.model.as_mut()) {
+                            model.toggle_up();
                         }
                     }
                     PreviewAction::CopyFiles | PreviewAction::CopyPaths => {}
@@ -801,8 +828,12 @@ impl ImageMozApp {
         }
         let focus = match &tab.preview {
             Some(preview) => {
-                if let Some(img) = preview.decoded_for(&preview.path) {
-                    self.finish_copy(ctx, self.cur, files, Some((*img).clone()));
+                let bitmap = match &preview.model {
+                    Some(model) => model.snapshot(),
+                    None => preview.decoded_for(&preview.path).map(|img| (*img).clone()),
+                };
+                if bitmap.is_some() {
+                    self.finish_copy(ctx, self.cur, files, bitmap);
                     return;
                 }
                 Some(preview.path.clone())
@@ -1071,11 +1102,12 @@ impl ImageMozApp {
             let win = self.windows.state_mut(id);
             if let Some(tab) = win.tabs.get_mut(win.active) {
                 let thumb = tab.preview.as_ref().and_then(|p| tab.gallery.thumbnail(&mut self.thumbs, p.index));
+                let gpu = self.render_state.as_ref().zip(self.model_renderer.as_ref());
                 let frame = Frame::NONE.fill(preview_view::BACKGROUND);
                 egui::CentralPanel::default().frame(frame).show(ui, |ui| {
                     if let Some(preview) = &mut tab.preview {
                         preview.poll(&ctx);
-                        preview_view::show(ui, preview, thumb.as_ref());
+                        preview_view::show(ui, preview, thumb.as_ref(), gpu);
                     }
                 });
             }

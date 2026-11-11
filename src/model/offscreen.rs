@@ -88,20 +88,8 @@ impl Offscreen {
     /// Renders `scene` into a square image with a transparent background.
     pub fn render(&self, scene: &Scene, size: u32) -> Result<RgbaImage, String> {
         self.check_lost()?;
-        let scopes = [
-            wgpu::ErrorFilter::OutOfMemory,
-            wgpu::ErrorFilter::Internal,
-            wgpu::ErrorFilter::Validation,
-        ]
-        .map(|filter| self.device.push_error_scope(filter));
-        let result = guard_panics(|| self.render_in_scopes(scene, size));
-        // Scopes must pop innermost first.
-        let errors: Vec<String> = scopes
-            .into_iter()
-            .rev()
-            .filter_map(|scope| pollster::block_on(scope.pop()))
-            .map(|e| e.to_string())
-            .collect();
+        let (result, errors) =
+            with_error_scopes(&self.device, || guard_panics(|| self.render_in_scopes(scene, size)));
         self.check_lost()?;
         if !errors.is_empty() {
             return Err(format!("GPU error: {}", errors.join("; ")));
@@ -140,9 +128,28 @@ impl Offscreen {
     }
 }
 
+/// Runs `work` under out-of-memory, internal and validation scopes and returns the errors they caught.
+pub(crate) fn with_error_scopes<T>(device: &wgpu::Device, work: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let scopes = [
+        wgpu::ErrorFilter::OutOfMemory,
+        wgpu::ErrorFilter::Internal,
+        wgpu::ErrorFilter::Validation,
+    ]
+    .map(|filter| device.push_error_scope(filter));
+    let value = work();
+    // Scopes must pop innermost first.
+    let errors = scopes
+        .into_iter()
+        .rev()
+        .filter_map(|scope| pollster::block_on(scope.pop()))
+        .map(|e| e.to_string())
+        .collect();
+    (value, errors)
+}
+
 /// Builds the renderer under a validation scope, since wgpu would otherwise
 /// only log a pipeline or shader failure here.
-fn build_renderer(device: &wgpu::Device) -> Result<ModelRenderer, String> {
+pub(crate) fn build_renderer(device: &wgpu::Device) -> Result<ModelRenderer, String> {
     capture_validation(device, || ModelRenderer::new(device))
         .map_err(|e| format!("cannot build the model renderer: {e}"))
 }
@@ -157,7 +164,7 @@ fn capture_validation<T>(device: &wgpu::Device, work: impl FnOnce() -> T) -> Res
 }
 
 /// `Device::poll` panics on some device failures in wgpu 29; report those as errors.
-fn guard_panics<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+pub(crate) fn guard_panics<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|panic| {
         let what = panic
             .downcast_ref::<String>()
@@ -231,7 +238,7 @@ fn linear_to_srgb(c: f32) -> f32 {
 
 /// The MSAA resolve averages model samples with transparent ones, so edge
 /// pixels come out premultiplied in linear light; undo that for straight alpha.
-fn unpremultiply_edges(image: &mut RgbaImage) {
+pub(crate) fn unpremultiply_edges(image: &mut RgbaImage) {
     for px in image.pixels_mut().filter(|p| p.0[3] > 0 && p.0[3] < 255) {
         let alpha = px.0[3] as f32 / 255.0;
         for c in &mut px.0[..3] {

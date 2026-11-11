@@ -7,6 +7,7 @@ mod obj;
 pub mod offscreen;
 mod stl;
 mod threemf;
+pub mod view;
 
 use std::ops::Range;
 use std::path::Path;
