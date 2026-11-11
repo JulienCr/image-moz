@@ -5,6 +5,7 @@ pub mod geometry;
 pub mod instance;
 pub mod layout;
 pub mod library;
+pub mod model;
 pub mod platform;
 pub mod preview;
 pub mod selection;
