@@ -281,20 +281,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs the author's local .blend files"]
+    #[ignore = "needs .blend files listed in IMAGE_MOZ_REAL_BLENDS"]
     fn real_files() {
-        let out = std::path::Path::new(
-            r"C:\Users\julie\AppData\Local\Temp\claude\9f053d9fcb04177f\aec86071-f5be-405d-95a3-77f49ad42799\scratchpad",
-        );
-        // architecture.blend is zstd and was saved without a preview (REND then GLOB).
-        let t = std::time::Instant::now();
-        let zstd = embedded_thumbnail(Path::new(r"D:\dev\room-model-traces\live\architecture.blend"));
-        println!("architecture.blend: {:?} in {:?}", zstd.as_ref().map(Option::is_some), t.elapsed());
-        assert!(zstd.unwrap().is_none());
-        let t = std::time::Instant::now();
-        let raw = embedded_thumbnail(Path::new(r"D:\dev\blender-tools\paris-nation\paris-nation.blend"));
-        let img = raw.unwrap().expect("thumbnail");
-        println!("paris-nation.blend: {}x{} in {:?}", img.width(), img.height(), t.elapsed());
-        img.save(out.join("blend-paris-nation.png")).unwrap();
+        let Some(list) = std::env::var_os("IMAGE_MOZ_REAL_BLENDS") else {
+            println!("IMAGE_MOZ_REAL_BLENDS is unset (';'-separated .blend paths); nothing to check");
+            return;
+        };
+        for (i, blend) in std::env::split_paths(&list).enumerate() {
+            let t = std::time::Instant::now();
+            let found = embedded_thumbnail(&blend).unwrap();
+            let Some(img) = found else {
+                println!("{}: no thumbnail, in {:?}", blend.display(), t.elapsed());
+                continue;
+            };
+            println!("{}: {}x{} in {:?}", blend.display(), img.width(), img.height(), t.elapsed());
+            img.save(std::env::temp_dir().join(format!("blend-real-{i}.png"))).unwrap();
+        }
     }
 }
