@@ -1,6 +1,9 @@
 //! Renderable 3D scene shared by every model loader.
 
 mod gltf;
+mod obj;
+mod stl;
+mod threemf;
 
 use std::ops::Range;
 use std::path::Path;
@@ -117,6 +120,9 @@ pub fn load(path: &Path) -> Result<Scene, ModelError> {
         .unwrap_or_default();
     let scene = match ext.as_str() {
         "glb" | "gltf" => gltf::load_gltf(path)?,
+        "obj" => obj::load_obj(path)?,
+        "stl" => stl::load_stl(path)?,
+        "3mf" => threemf::load_3mf(path)?,
         _ => return Err(ModelError::Unsupported),
     };
     if scene.triangle_count() == 0 {
