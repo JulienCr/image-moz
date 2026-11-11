@@ -79,7 +79,11 @@ impl OrbitCamera {
             yaw,
             pitch,
             distance: t,
-            yfov: cam.yfov,
+            yfov: if cam.yfov.is_finite() && cam.yfov > 0.01 && cam.yfov < 3.0 {
+                cam.yfov
+            } else {
+                DEFAULT_YFOV
+            },
             up,
             framed_distance: framed.distance,
         }
@@ -283,5 +287,33 @@ mod tests {
         assert!((o.distance - d * 1e-3).abs() < d * 1e-6);
         o.dolly(-1e6);
         assert!((o.distance - d * 1e4).abs() < d);
+    }
+}
+
+#[cfg(test)]
+mod yfov_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_file_yfov_falls_back_to_default() {
+        let b = Aabb {
+            min: Vec3::splat(-1.0),
+            max: Vec3::splat(1.0),
+        };
+        for yfov in [0.0, f32::NAN, -1.0, 3.5, f32::INFINITY] {
+            let cam = SceneCamera {
+                eye: Vec3::new(4.0, 3.0, 4.0),
+                target: Vec3::ZERO,
+                up: Vec3::Y,
+                yfov,
+            };
+            let o = OrbitCamera::from_scene(&cam, &b, UpAxis::Y);
+            assert_eq!(o.yfov, 0.8, "{yfov}");
+            assert!(o
+                .view_proj(1.0, &b)
+                .to_cols_array()
+                .iter()
+                .all(|v| v.is_finite()));
+        }
     }
 }
