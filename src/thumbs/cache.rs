@@ -70,6 +70,11 @@ impl DiskCache {
         })
     }
 
+    /// Drops the entry for `key`; a missing one is not an error.
+    pub fn remove(&self, key: ThumbKey) {
+        let _ = fs::remove_file(self.path_for(key));
+    }
+
     /// Deletes the least recently used entries until the total is at most
     /// `ceiling`; returns the number of bytes removed.
     pub fn purge_to(&self, ceiling: u64) -> io::Result<u64> {
@@ -195,6 +200,18 @@ mod tests {
         bytes[..4].copy_from_slice(b"IMZ1");
         fs::write(&path, bytes).unwrap();
         assert!(cache.get(ThumbKey(1)).is_none());
+    }
+
+    #[test]
+    fn remove_drops_only_the_given_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(dir.path().to_path_buf()).unwrap();
+        cache.put(ThumbKey(1), &thumb(8, 8)).unwrap();
+        cache.put(ThumbKey(2), &thumb(8, 8)).unwrap();
+        cache.remove(ThumbKey(1));
+        cache.remove(ThumbKey(99));
+        assert!(cache.get(ThumbKey(1)).is_none());
+        assert!(cache.get(ThumbKey(2)).is_some());
     }
 
     #[test]

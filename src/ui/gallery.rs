@@ -143,6 +143,7 @@ static NEXT_GALLERY_ID: AtomicU64 = AtomicU64::new(1);
 /// so several windows can show a tab at once without one starving the other.
 pub struct Thumbs {
     pipeline: ThumbPipeline,
+    cache: DiskCache,
     textures: TextureCache,
     backlog: VecDeque<ThumbResult>,
     wanted: Requests,
@@ -252,13 +253,20 @@ impl Thumbs {
             Arc::new(move || ctx.request_repaint())
         };
         Self {
-            pipeline: ThumbPipeline::new(cache, wake),
+            pipeline: ThumbPipeline::new(cache.clone(), wake),
+            cache,
             textures: TextureCache::default(),
             backlog: VecDeque::new(),
             wanted: Requests::default(),
             probes: Requests::default(),
             near_tiles: HashMap::new(),
         }
+    }
+
+    /// Drops the texture and the disk entry of `key` so its next request renders from the source.
+    fn invalidate(&mut self, key: ThumbKey) {
+        self.textures.remove(key);
+        self.cache.remove(key);
     }
 
     /// Drops every queued request, e.g. when no tab is left to want them.
@@ -495,9 +503,13 @@ impl Gallery {
         self.library_changed();
     }
 
-    /// User refresh: failed tiles get another attempt.
+    /// User refresh: failed tiles get another attempt, and model thumbnails are rendered anew
+    /// because their annex files (.mtl, .bin, textures) change without touching the model's key.
     pub fn retry_failed(&mut self, thumbs: &mut Thumbs, library: &mut Library) {
         library.clear_errors();
+        for entry in library.iter().filter(|e| formats::kind(&e.path) == Some(formats::MediaKind::Model)) {
+            thumbs.invalidate(key_for(&entry.path, entry.mtime, entry.size));
+        }
         thumbs.pipeline.forget_all();
         self.last_wanted = None;
         self.library_changed();
@@ -1161,6 +1173,39 @@ mod tests {
         assert!(!library.get(&bad).unwrap().error);
         probe(&mut thumbs, &mut gallery, &library);
         assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &bad, |e| e.error));
+    }
+
+    #[test]
+    fn refresh_renders_model_thumbnails_again_but_keeps_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let (model, img) = (dir.path().join("m.obj"), dir.path().join("a.png"));
+        std::fs::write(&model, b"not a model").unwrap();
+        write_image(&img);
+        let ctx = Context::default();
+        let cache = DiskCache::open(dir.path().join("cache")).unwrap();
+        let mut thumbs = Thumbs::with_cache(&ctx, cache.clone());
+        let mut gallery = Gallery::new();
+        let mut library = library_of(dir.path());
+        let jobs = [&model, &img].map(|p| {
+            let e = library.get(p).unwrap();
+            ThumbJob { path: e.path.clone(), key: key_for(&e.path, e.mtime, e.size) }
+        });
+        let keys = jobs.clone().map(|j| j.key);
+        let stale = crate::thumbs::Thumb { image: image::RgbaImage::new(2, 2), orig_dims: (40, 20), triangles: Some(1) };
+        for key in keys {
+            cache.put(key, &stale).unwrap();
+        }
+        thumbs.set_wanted(gallery.id, jobs.to_vec());
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &model, has_dims));
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
+        assert!(thumbs.textures.contains(keys[0]) && thumbs.textures.contains(keys[1]));
+
+        gallery.retry_failed(&mut thumbs, &mut library);
+        assert!(!thumbs.textures.contains(keys[0]) && cache.get(keys[0]).is_none());
+        assert!(thumbs.textures.contains(keys[1]) && cache.get(keys[1]).is_some());
+
+        thumbs.set_wanted(gallery.id, jobs.to_vec());
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &model, |e| e.error));
     }
 
     #[test]
