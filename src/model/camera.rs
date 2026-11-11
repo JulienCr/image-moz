@@ -23,6 +23,8 @@ pub struct OrbitCamera {
     pub up: UpAxis,
     /// Distance the dolly clamp is relative to.
     framed_distance: f32,
+    /// Aspect `yfov` is defined at; narrower viewports widen the vertical FOV.
+    fit_aspect: f32,
 }
 
 /// World-space (right, up, back) axes at yaw 0, pitch 0.
@@ -53,6 +55,7 @@ impl OrbitCamera {
             yfov: DEFAULT_YFOV,
             up,
             framed_distance: distance,
+            fit_aspect: 1.0,
         }
     }
 
@@ -86,6 +89,7 @@ impl OrbitCamera {
             },
             up,
             framed_distance: framed.distance,
+            fit_aspect: cam.aspect.filter(|a| a.is_finite() && *a > 0.0).unwrap_or(1.0),
         }
     }
 
@@ -117,7 +121,13 @@ impl OrbitCamera {
             1.0
         };
         let (_, up, _) = basis(self.up);
-        rh::proj::directx::perspective(self.yfov, aspect, near, far)
+        // Keep the horizontal field of view when the viewport is narrower than the fit aspect.
+        let yfov = if aspect < self.fit_aspect {
+            2.0 * ((self.yfov * 0.5).tan() * self.fit_aspect / aspect).atan()
+        } else {
+            self.yfov
+        };
+        rh::proj::directx::perspective(yfov, aspect, near, far)
             * rh::view::look_at_mat4(eye, self.target, up)
     }
 
@@ -191,6 +201,50 @@ mod tests {
     }
 
     #[test]
+    fn framed_keeps_whole_box_in_a_portrait_viewport() {
+        let b = bx();
+        let m = OrbitCamera::framed(&b, UpAxis::Y).view_proj(0.5, &b);
+        for i in 0..8 {
+            let p = Vec3::new(
+                if i & 1 == 0 { b.min.x } else { b.max.x },
+                if i & 2 == 0 { b.min.y } else { b.max.y },
+                if i & 4 == 0 { b.min.z } else { b.max.z },
+            );
+            let n = ndc(m, p);
+            assert!(n.x.abs() <= 1.0 && n.y.abs() <= 1.0, "{p} -> {n}");
+        }
+    }
+
+    #[test]
+    fn file_camera_keeps_its_horizontal_view_in_a_square() {
+        let b = Aabb {
+            min: Vec3::splat(-1.0),
+            max: Vec3::splat(1.0),
+        };
+        let cam = SceneCamera {
+            eye: Vec3::new(4.0, 3.0, 4.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            yfov: 0.6,
+            aspect: Some(16.0 / 9.0),
+        };
+        let o = OrbitCamera::from_scene(&cam, &b, UpAxis::Y);
+        let forward = (o.target - o.eye()).normalize();
+        let right = forward.cross(Vec3::Y).normalize();
+        let cam_up = right.cross(forward);
+        let half_v = (0.6f32 * 0.5).tan();
+        let edge_x = o.eye() + forward * 5.0 + right * 5.0 * half_v * (16.0 / 9.0);
+        for aspect in [16.0 / 9.0, 1.0] {
+            let n = ndc(o.view_proj(aspect, &b), edge_x);
+            assert!((n.x - 1.0).abs() < 1e-3, "aspect {aspect}: {n}");
+        }
+        // Wider viewports keep the authored vertical FOV.
+        let edge_y = o.eye() + forward * 5.0 + cam_up * 5.0 * half_v;
+        let n = ndc(o.view_proj(2.5, &b), edge_y);
+        assert!((n.y - 1.0).abs() < 1e-3, "{n}");
+    }
+
+    #[test]
     fn framed_up_axis_is_world_up() {
         let b = bx();
         for up in [UpAxis::Y, UpAxis::Z] {
@@ -207,6 +261,7 @@ mod tests {
             target: Vec3::ZERO,
             up: Vec3::Y,
             yfov: 0.6,
+            aspect: None,
         };
         let b = Aabb {
             min: Vec3::splat(-1.0),
@@ -229,12 +284,14 @@ mod tests {
             target: Vec3::ONE,
             up: Vec3::Y,
             yfov: 0.5,
+            aspect: None,
         };
         let vertical = SceneCamera {
             eye: Vec3::new(0.0, 5.0, 0.0),
             target: Vec3::ZERO,
             up: Vec3::Y,
             yfov: 0.5,
+            aspect: None,
         };
         for o in [
             OrbitCamera::framed(&flat, UpAxis::Y),
@@ -306,6 +363,7 @@ mod yfov_tests {
                 target: Vec3::ZERO,
                 up: Vec3::Y,
                 yfov,
+                aspect: None,
             };
             let o = OrbitCamera::from_scene(&cam, &b, UpAxis::Y);
             assert_eq!(o.yfov, 0.8, "{yfov}");

@@ -244,6 +244,20 @@ mod tests {
     }
 
     #[test]
+    fn file_camera_keeps_the_whole_model_in_a_square_thumbnail() {
+        let img = Offscreen::shared()
+            .unwrap()
+            .render(&scene("cube.glb"), 128)
+            .unwrap();
+        let last = 127;
+        let border_hits = (0..128)
+            .flat_map(|i| [(i, 0), (i, last), (0, i), (last, i)])
+            .filter(|&(x, y)| img.get_pixel(x, y).0[3] > 0)
+            .count();
+        assert_eq!(border_hits, 0, "model touches the image border");
+    }
+
+    #[test]
     fn unaligned_row_size_keeps_the_image_intact() {
         let img = Offscreen::shared()
             .unwrap()

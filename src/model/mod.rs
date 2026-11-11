@@ -41,6 +41,8 @@ pub struct SceneCamera {
     pub target: Vec3,
     pub up: Vec3,
     pub yfov: f32,
+    /// Width over height the file camera was authored for.
+    pub aspect: Option<f32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]

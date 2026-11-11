@@ -97,7 +97,8 @@ fn camera_at(camera: &::gltf::Camera, world: &Mat4) -> Option<SceneCamera> {
     if !finite || forward == Vec3::ZERO || up == Vec3::ZERO {
         return None;
     }
-    Some(SceneCamera { eye, target: eye + forward, up, yfov: p.yfov() })
+    let aspect = p.aspect_ratio().filter(|a| a.is_finite() && *a > 0.0);
+    Some(SceneCamera { eye, target: eye + forward, up, yfov: p.yfov(), aspect })
 }
 
 fn append_primitive(
@@ -182,6 +183,8 @@ mod tests {
         let cam = load(&fixture("cube.glb")).unwrap().camera.unwrap();
         assert!((cam.eye - Vec3::new(4.0, 3.0, 4.0)).length() < 1e-3, "{:?}", cam.eye);
         assert!((cam.target - cam.eye).normalize().dot(-cam.eye.normalize()) > 0.999);
+        let aspect = cam.aspect.expect("cube.glb camera has an aspect ratio");
+        assert!((aspect - 16.0 / 9.0).abs() < 1e-3, "{aspect}");
     }
 
     #[test]
