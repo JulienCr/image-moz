@@ -1826,6 +1826,7 @@ dependencies = [
  "log",
  "notify",
  "notify-debouncer-full",
+ "pollster",
  "rfd",
  "serde",
  "serde_json",

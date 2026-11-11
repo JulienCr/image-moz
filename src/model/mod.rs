@@ -2,7 +2,9 @@
 
 pub mod camera;
 mod gltf;
+pub mod gpu;
 mod obj;
+pub mod offscreen;
 mod stl;
 mod threemf;
 
