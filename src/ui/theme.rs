@@ -278,7 +278,7 @@ pub fn install_fonts(ctx: &Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Phosphor Regular codepoints; render with any family, Phosphor is in every fallback chain.
+/// Phosphor Regular codepoints; draw them with [`icon_font`].
 pub mod icons {
     pub const FOLDER_OPEN: &str = "\u{e256}";
     pub const TREE_STRUCTURE: &str = "\u{e67c}";

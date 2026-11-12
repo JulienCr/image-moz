@@ -21,6 +21,7 @@ use crate::model::offscreen::build_renderer;
 use crate::platform;
 use crate::tab::{FolderIssue, OpenTarget, Tab, WindowState, absolute, wake};
 use crate::ui::gallery::{self, Thumbs};
+use crate::ui::empty;
 use crate::ui::preview_view;
 use crate::ui::status::{self, StatusInfo};
 use crate::ui::tabbar::{self, DragView, TabBarEvents};
@@ -922,7 +923,7 @@ impl ImageMozApp {
     fn central(&mut self, ui: &mut egui::Ui) {
         let win = self.windows.state_mut(self.cur);
         let Some(tab) = win.tabs.get_mut(win.active) else {
-            self.open_requested |= message(ui, "Aucun dossier ouvert", true);
+            self.open_requested |= empty::show(ui);
             return;
         };
         if let Some(issue) = tab.folder_issue {
@@ -963,6 +964,22 @@ impl ImageMozApp {
             self.config_dirty = true;
         }
     }
+}
+
+fn preview_info(tab: &Tab) -> Option<preview_view::Info> {
+    let preview = tab.preview.as_ref()?;
+    let entry = tab.library.get(&preview.path)?;
+    Some(preview_view::Info {
+        name: entry.name.clone(),
+        meta: [status::dims_text(entry), status::format_size(entry.size)]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · "),
+        rel_dir: entry.rel_dir.clone(),
+        triangles: entry.triangles,
+        position: (preview.index + 1, tab.gallery.order().len()),
+    })
 }
 
 fn apply_tile_events(tab: &mut Tab, out: &gallery::Output) {
@@ -1082,7 +1099,7 @@ impl ImageMozApp {
             .map_or_else(FolderSettings::default, |t| FolderSettings { recursive: t.recursive, sort: t.sort, flat: t.flat });
         let mut filter = win.active_tab().map_or_else(String::new, |t| t.gallery.filter().to_owned());
         let has_tab = win.active_tab().is_some();
-        let events = if previewing {
+        let events = if previewing || win.tabs.is_empty() {
             toolbar::ToolbarEvents::default()
         } else {
             let frame = Frame::NONE.fill(theme::palette(&ctx).toolbar_bg).inner_margin(Margin::symmetric(10, 0));
@@ -1128,12 +1145,20 @@ impl ImageMozApp {
                 let thumb = tab.preview.as_ref().and_then(|p| tab.gallery.thumbnail(&mut self.thumbs, p.index));
                 let gpu = self.render_state.as_ref().zip(self.model_renderer.as_ref());
                 let frame = Frame::NONE.fill(theme::palette(&ctx).preview_bg);
-                egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-                    if let Some(preview) = &mut tab.preview {
+                let info = preview_info(tab);
+                let nav = egui::CentralPanel::default()
+                    .frame(frame)
+                    .show(ui, |ui| {
+                        let (preview, info) = (tab.preview.as_mut()?, info?);
                         preview.poll(&ctx);
-                        preview_view::show(ui, preview, thumb.as_ref(), gpu);
-                    }
-                });
+                        preview_view::show(ui, preview, thumb.as_ref(), gpu, &info)
+                    })
+                    .inner;
+                match nav {
+                    Some(preview_view::Nav::Close) => tab.preview = None,
+                    Some(preview_view::Nav::Step(delta)) => tab.step_preview(&ctx, delta),
+                    None => {}
+                }
             }
         } else {
             let frame = Frame::NONE.fill(theme::palette(&ctx).gallery_bg).inner_margin(Margin::same(6));

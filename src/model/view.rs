@@ -100,6 +100,10 @@ impl ModelView {
         })
     }
 
+    pub fn triangle_count(&self) -> u32 {
+        self.scene.triangle_count()
+    }
+
     pub fn camera(&self) -> &OrbitCamera {
         &self.camera
     }
