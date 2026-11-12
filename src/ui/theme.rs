@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 
 pub const MEDIUM: &str = "medium";
 pub const SEMIBOLD: &str = "semibold";
+/// Phosphor alone: Inter and Segoe UI Symbol carry other glyphs on some of its codepoints.
+pub const ICONS: &str = "icons";
+
+pub fn icon_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(ICONS.into()))
+}
 
 /// Colour roles of one theme; look them up with [`palette`].
 pub struct Palette {
@@ -268,10 +274,11 @@ pub fn install_fonts(ctx: &Context) {
         fonts.families.insert(family.clone(), vec![face.into(), "inter".into()]);
         tail(&mut fonts, family);
     }
+    fonts.families.insert(FontFamily::Name(ICONS.into()), vec!["phosphor".into()]);
     ctx.set_fonts(fonts);
 }
 
-/// Phosphor Regular codepoints; render with any family, Phosphor is in every fallback chain.
+/// Phosphor Regular codepoints; draw them with [`icon_font`].
 pub mod icons {
     pub const FOLDER_OPEN: &str = "\u{e256}";
     pub const TREE_STRUCTURE: &str = "\u{e67c}";
