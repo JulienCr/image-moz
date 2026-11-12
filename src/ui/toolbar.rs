@@ -28,15 +28,90 @@ struct Responsive {
     filter_width: f32,
     chip_labels: bool,
     bento_prefix: bool,
+    sort_label: bool,
+    slider_width: f32,
+    bento_label: bool,
 }
 
+const SORT_WIDTH: f32 = 100.0;
+const SORT_COMPACT_WIDTH: f32 = 52.0;
+const BENTO_ICON_WIDTH: f32 = 52.0;
+/// Free space kept between the left groups and the slider/filter group.
+const GROUP_GAP: f32 = 16.0;
+
+/// Spec breakpoints, from the window width alone.
 fn responsive(width: f32) -> Responsive {
     Responsive {
         slider_icons: width >= 1100.0,
         filter_width: if width >= 1100.0 { 240.0 } else { 180.0 },
         chip_labels: width >= 960.0,
         bento_prefix: width >= 960.0,
+        sort_label: true,
+        slider_width: 120.0,
+        bento_label: true,
     }
+}
+
+/// Degrades `r` step by step until `required(r)` fits in `available`.
+fn fit(mut r: Responsive, available: f32, required: impl Fn(&Responsive) -> f32) -> Responsive {
+    let steps: [fn(&mut Responsive); 4] = [
+        |r| r.sort_label = false,
+        |r| r.slider_width = 80.0,
+        |r| r.filter_width = r.filter_width.min(140.0),
+        |r| r.bento_label = false,
+    ];
+    for step in steps {
+        if required(&r) <= available {
+            break;
+        }
+        step(&mut r);
+    }
+    r
+}
+
+fn text_width(ui: &Ui, text: &str, font: FontId) -> f32 {
+    ui.painter().layout_no_wrap(text.to_owned(), font, Color32::WHITE).size().x
+}
+
+fn chip_width(ui: &Ui, icon: &str, icon_size: f32, label: Option<&str>) -> f32 {
+    match label {
+        Some(l) => 20.0 + text_width(ui, icon, theme::icon_font(icon_size)) + 6.0 + text_width(ui, l, medium()),
+        None => CONTROL,
+    }
+}
+
+fn right_group_width(r: &Responsive) -> f32 {
+    let icons = if r.slider_icons { 16.0 + 8.0 + 8.0 + 12.0 } else { 0.0 };
+    r.filter_width + 8.0 + 4.0 + r.slider_width + icons
+}
+
+fn bento_width(r: &Responsive) -> f32 {
+    if !r.bento_label {
+        BENTO_ICON_WIDTH
+    } else if r.bento_prefix {
+        150.0
+    } else {
+        90.0
+    }
+}
+
+/// Width the left groups need with `r` applied, spacing included (measured within 15 px, over).
+fn left_group_width(ui: &Ui, r: &Responsive, bento: bool) -> f32 {
+    let label = |text| r.chip_labels.then_some(text);
+    let open = 20.0 + text_width(ui, icons::FOLDER_OPEN, theme::icon_font(16.0)) + 6.0 + text_width(ui, "Ouvrir", medium());
+    let separator = 12.0 + 1.0 + 12.0;
+    let segmented = 4.0 + 3.0 * 32.0 + 2.0 * 2.0;
+    let sort = if r.sort_label { SORT_WIDTH } else { SORT_COMPACT_WIDTH };
+    let gaps = if bento { 12.0 } else { 11.0 };
+    open + separator
+        + chip_width(ui, icons::TREE_STRUCTURE, 14.0, label("Récursif"))
+        + chip_width(ui, icons::LIST, 14.0, label("À plat"))
+        + separator
+        + segmented
+        + 8.0
+        + sort
+        + if bento { bento_width(r) } else { 0.0 }
+        + gaps * 4.0
 }
 
 fn sort_label(sort: SortOrder) -> &'static str {
@@ -163,13 +238,14 @@ fn combo<R>(
     text: impl Into<eframe::egui::WidgetText>,
     width: f32,
     items: impl FnOnce(&mut Ui) -> R,
-) {
+) -> Response {
     let color = theme::palette(ui.ctx()).text_weak;
     ComboBox::from_id_salt(id)
         .selected_text(text)
         .width(width)
         .icon(move |ui, rect, _, _| caret(ui, rect, color))
-        .show_ui(ui, items);
+        .show_ui(ui, items)
+        .response
 }
 
 fn small_square(ui: &mut Ui, side: f32, color: Color32) {
@@ -223,8 +299,8 @@ fn filter_field(ui: &mut Ui, filter: &mut String, width: f32) {
     });
 }
 
-fn size_slider(ui: &mut Ui, config: &mut Config, p: &Palette) -> bool {
-    ui.spacing_mut().slider_width = 120.0;
+fn size_slider(ui: &mut Ui, config: &mut Config, p: &Palette, width: f32) -> bool {
+    ui.spacing_mut().slider_width = width;
     ui.spacing_mut().slider_rail_height = 4.0;
     ui.visuals_mut().selection.bg_fill = p.accent;
     let slider = Slider::new(&mut config.target_size, MIN_SIZE..=MAX_SIZE)
@@ -253,8 +329,35 @@ pub fn show(
 ) -> ToolbarEvents {
     let mut events = ToolbarEvents::default();
     let p = theme::palette(ui.ctx());
-    let narrow = responsive(ui.ctx().viewport_rect().width());
-    ui.horizontal_centered(|ui| {
+    let bento = config.layout == LayoutKind::Bento;
+    let narrow = fit(responsive(ui.ctx().viewport_rect().width()), ui.available_width(), |r| {
+        left_group_width(ui, r, bento) + GROUP_GAP + right_group_width(r)
+    });
+    let full = ui.available_rect_before_wrap();
+    let right_rect = Rect::from_min_max(pos2(full.right() - right_group_width(&narrow), full.top()), full.max);
+    let left_rect = Rect::from_min_max(full.min, pos2(right_rect.left() - GROUP_GAP / 2.0, full.bottom()));
+    ui.scope_builder(UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.add_enabled_ui(has_tab, |ui| filter_field(ui, filter, narrow.filter_width));
+        ui.add_space(4.0);
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // Right to left: the large icon is added first, so the order below is reversed.
+                if narrow.slider_icons {
+                    small_square(ui, 16.0, p.text_weak);
+                    ui.add_space(8.0);
+                }
+                events.config_changed |= size_slider(ui, config, p, narrow.slider_width);
+                if narrow.slider_icons {
+                    ui.add_space(8.0);
+                    small_square(ui, 12.0, p.text_weak);
+                }
+            });
+        });
+    });
+    ui.scope_builder(UiBuilder::new().max_rect(left_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
+        ui.set_clip_rect(ui.clip_rect().intersect(left_rect));
         ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
         let open = Button { icon: icons::FOLDER_OPEN, icon_size: 16.0, label: Some("Ouvrir"), selected: false, filled: true };
         if button(ui, open).on_hover_text("Ouvrir un dossier").clicked() {
@@ -304,48 +407,40 @@ pub fn show(
             let mut job = LayoutJob::default();
             let color = p.text_muted;
             job.append(sort_icon(folder.sort), 0.0, TextFormat::simple(theme::icon_font(14.0), color));
-            job.append(sort_label(folder.sort), 6.0, TextFormat::simple(medium(), color));
-            combo(ui, "sort_order", job, 100.0, |ui| {
+            if narrow.sort_label {
+                job.append(sort_label(folder.sort), 6.0, TextFormat::simple(medium(), color));
+            }
+            let width = if narrow.sort_label { SORT_WIDTH } else { SORT_COMPACT_WIDTH };
+            let response = combo(ui, "sort_order", job, width, |ui| {
                 for sort in [SortOrder::DateDesc, SortOrder::DateAsc, SortOrder::NameAsc, SortOrder::NameDesc] {
                     ui.selectable_value(&mut folder.sort, sort, sort_label(sort));
                 }
             });
+            if !narrow.sort_label {
+                response.on_hover_text(format!("Tri : {}", sort_label(folder.sort)));
+            }
         });
         if config.layout == LayoutKind::Bento {
             let mut job = LayoutJob::default();
             let regular = FontId::proportional(13.0);
-            if narrow.bento_prefix {
-                job.append("Grandes : ", 0.0, TextFormat::simple(regular, p.text_weak));
+            if !narrow.bento_label {
+                job.append(icons::ARROWS_OUT, 0.0, TextFormat::simple(theme::icon_font(14.0), p.text_weak));
+            } else {
+                if narrow.bento_prefix {
+                    job.append("Grandes : ", 0.0, TextFormat::simple(regular, p.text_weak));
+                }
+                job.append(rule_label(config.bento_rule), 0.0, TextFormat::simple(medium(), p.text));
             }
-            job.append(rule_label(config.bento_rule), 0.0, TextFormat::simple(medium(), p.text));
-            let width = if narrow.bento_prefix { 150.0 } else { 90.0 };
-            combo(ui, "bento_rule", job, width, |ui| {
+            let response = combo(ui, "bento_rule", job, bento_width(&narrow), |ui| {
                 for rule in [BentoRule::Recent, BentoRule::Pinned, BentoRule::Resolution] {
                     events.config_changed |= ui.selectable_value(&mut config.bento_rule, rule, rule_label(rule)).changed();
                 }
             });
+            if !narrow.bento_label {
+                response.on_hover_text(format!("Grandes : {}", rule_label(config.bento_rule)));
+            }
         }
 
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            ui.add_enabled_ui(has_tab, |ui| filter_field(ui, filter, narrow.filter_width));
-            ui.add_space(4.0);
-            ui.scope(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Right to left: the large icon is added first, so the order below is reversed.
-                    if narrow.slider_icons {
-                        small_square(ui, 16.0, p.text_weak);
-                        ui.add_space(8.0);
-                    }
-                    events.config_changed |= size_slider(ui, config, p);
-                    if narrow.slider_icons {
-                        ui.add_space(8.0);
-                        small_square(ui, 12.0, p.text_weak);
-                    }
-                });
-            });
-        });
     });
     events
 }
@@ -374,5 +469,44 @@ mod tests {
         assert!(!responsive(1099.0).slider_icons);
         assert!(responsive(960.0).chip_labels);
         assert!(!responsive(959.0).chip_labels);
+    }
+
+    /// Required width of a fake toolbar: each degradation step frees exactly 20 px.
+    fn fake_required(r: &Responsive) -> f32 {
+        100.0
+            + if r.sort_label { 20.0 } else { 0.0 }
+            + if r.slider_width > 80.0 { 20.0 } else { 0.0 }
+            + if r.filter_width > 140.0 { 20.0 } else { 0.0 }
+            + if r.bento_label { 20.0 } else { 0.0 }
+    }
+
+    #[test]
+    fn nothing_degrades_when_everything_fits() {
+        let r = fit(responsive(1280.0), 1000.0, fake_required);
+        assert!(r.sort_label && r.bento_label);
+        assert_eq!((r.slider_width, r.filter_width), (120.0, 240.0));
+    }
+
+    #[test]
+    fn steps_apply_in_order_and_stop_once_it_fits() {
+        let r = fit(responsive(1000.0), 179.0, fake_required);
+        assert!(!r.sort_label && r.slider_width == 120.0);
+
+        let r = fit(responsive(1000.0), 159.0, fake_required);
+        assert!(!r.sort_label && r.slider_width == 80.0 && r.filter_width == 180.0);
+
+        let r = fit(responsive(1000.0), 139.0, fake_required);
+        assert!(r.filter_width == 140.0 && r.bento_label);
+
+        let r = fit(responsive(1000.0), 100.0, fake_required);
+        assert!(!r.sort_label && !r.bento_label && r.slider_width == 80.0 && r.filter_width == 140.0);
+    }
+
+    #[test]
+    fn the_filter_never_grows_when_it_shrinks() {
+        let r = fit(responsive(1280.0), 0.0, fake_required);
+        assert_eq!(r.filter_width, 140.0);
+        let r = fit(responsive(600.0), 0.0, fake_required);
+        assert_eq!(r.filter_width, 140.0);
     }
 }

@@ -47,11 +47,6 @@ pub fn dims_text(entry: &Entry) -> String {
     }
 }
 
-/// Directory relative to the root; the root itself is shown as ".".
-pub fn rel_dir_label(entry: &Entry) -> &str {
-    if entry.rel_dir.is_empty() { "." } else { &entry.rel_dir }
-}
-
 /// Dimensions and size on one line, shared by the tooltip and the status bar.
 pub fn meta_text(entry: &Entry) -> String {
     let dims = dims_text(entry);
@@ -129,8 +124,8 @@ fn entry_info(ui: &mut Ui, entry: &Entry, recursive: bool) {
         ui.label(mono(dims, p.text_muted));
     }
     ui.label(mono(format_size(entry.size), p.text_muted));
-    if recursive {
-        ui.label(text(rel_dir_label(entry), p.text_weak));
+    if recursive && !entry.rel_dir.is_empty() {
+        ui.label(text(&entry.rel_dir, p.text_weak));
     }
     if entry.error {
         ui.label(text(format!("{} illisible", theme::icons::WARNING), p.error));

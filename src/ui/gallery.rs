@@ -229,6 +229,10 @@ fn open_cache() -> DiskCache {
     })
 }
 
+fn root_name(root: &Path) -> String {
+    root.file_name().unwrap_or(root.as_os_str()).to_string_lossy().into_owned()
+}
+
 fn collapse_key(rel_dir: &str) -> String {
     if rel_dir.is_empty() { ".".to_string() } else { rel_dir.to_lowercase() }
 }
@@ -487,8 +491,8 @@ fn tooltip_ui(ui: &mut Ui, entry: &Entry, texture: Option<(TextureId, Vec2)>, re
         }
         ui.add(egui::Label::new(RichText::new(&entry.name).font(semibold(13.0)).color(p.text)).truncate());
         ui.label(RichText::new(status::meta_text(entry)).font(FontId::monospace(11.5)).color(p.text_muted));
-        if recursive {
-            ui.label(RichText::new(status::rel_dir_label(entry)).size(12.0).color(p.text_weak));
+        if recursive && !entry.rel_dir.is_empty() {
+            ui.label(RichText::new(&entry.rel_dir).size(12.0).color(p.text_weak));
         }
     });
 }
@@ -838,7 +842,7 @@ impl Gallery {
                     self.order.push(path.clone());
                 }
             }
-            let label = if section.rel_dir.is_empty() { ".".to_string() } else { section.rel_dir.clone() };
+            let label = if section.rel_dir.is_empty() { root_name(view.root) } else { section.rel_dir.clone() };
             layout_sections.push(LayoutSection {
                 header: (view.recursive && !view.flat).then(|| label.clone()),
                 collapsed: is_collapsed,

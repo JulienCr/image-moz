@@ -241,6 +241,7 @@ Fond de la maquette : #0B0B0C autour, zone #111113 (à dériver du fond de galer
 
 - Sous 1 100 px de large : les deux icônes du slider disparaissent et le filtre passe à 180 px.
 - Sous 960 px : « Récursif » et « À plat » deviennent des icônes seules (infobulle avec le libellé) et « Grandes : » est retiré du combo Bento.
+- Plus étroit, la barre se dégrade selon la largeur réellement disponible, dans cet ordre : tri en icône + chevron (libellé en infobulle) ; slider à 80 px ; filtre à 140 px ; combo Bento en icône seule (infobulle « Grandes : … »). Le groupe slider + filtre est posé dans son propre rectangle à droite : il ne recouvre jamais les groupes de gauche. Largeur minimale de fenêtre : 720 pt.
 - La barre d'outils ne passe jamais sur deux lignes : la hauteur de 44 reste stable pour éviter un saut de la galerie.
 - Tout est en points logiques : à 200 %, egui double ; les miniatures 512 px couvrent une tuile de 256 logiques sans flou.
 

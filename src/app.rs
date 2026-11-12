@@ -34,7 +34,7 @@ const SIZE_STEP: f32 = 16.0;
 const TOAST_DURATION: Duration = Duration::from_secs(2);
 const APP_NAME: &str = "Image Moz";
 const DEFAULT_SIZE: (f32, f32) = (1200.0, 800.0);
-const MIN_SIZE_PTS: [f32; 2] = [480.0, 320.0];
+const MIN_SIZE_PTS: [f32; 2] = [720.0, 320.0];
 /// After a restore, the stored active window is raised once all windows exist, and focus changes
 /// the OS makes while they open are not taken for the user's choice, until this much time has passed.
 const RESTORE_RAISE_AT: Duration = Duration::from_millis(400);
