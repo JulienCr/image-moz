@@ -1,8 +1,10 @@
+use std::io::Read;
 use std::path::Path;
 
 use image::{Rgba32FImage, RgbaImage};
 
 use crate::blend::{self, BlendError};
+use crate::cgbi::{self, CgbiError};
 use crate::model::offscreen::{MODEL_RENDER_SIZE, Offscreen};
 use crate::model::{self, ModelError};
 
@@ -38,6 +40,8 @@ pub enum DecodeError {
     Gpu(String),
     #[error("blend error: {0}")]
     Blend(#[from] BlendError),
+    #[error(transparent)]
+    Cgbi(#[from] CgbiError),
     #[error("no embedded preview")]
     NoPreview,
 }
@@ -83,7 +87,13 @@ pub fn dimensions(path: &Path) -> Result<(u32, u32), DecodeError> {
     match kind(path) {
         Some(MediaKind::Model) => Ok((MODEL_RENDER_SIZE, MODEL_RENDER_SIZE)),
         Some(MediaKind::Blend) => Ok(blend_thumbnail(path)?.dimensions()),
-        _ => Ok(image::image_dimensions(path)?),
+        _ => {
+            let head = read_head(path)?;
+            if cgbi::is_cgbi(&head) {
+                return Ok(cgbi::dimensions(&head)?);
+            }
+            Ok(image::image_dimensions(path)?)
+        }
     }
 }
 
@@ -100,9 +110,20 @@ pub fn decode(path: &Path) -> Result<Decoded, DecodeError> {
         Some(MediaKind::Blend) => Ok(still(blend_thumbnail(path)?)),
         Some(MediaKind::Image) => match extension(path).as_deref() {
             Some("exr" | "hdr") => Ok(still(tonemap(&image::open(path)?.to_rgba32f()))),
-            _ => Ok(still(image::open(path)?.to_rgba8())),
+            _ => {
+                if cgbi::is_cgbi(&read_head(path)?) {
+                    return Ok(still(cgbi::decode(&std::fs::read(path)?)?));
+                }
+                Ok(still(image::open(path)?.to_rgba8()))
+            }
         },
     }
+}
+
+fn read_head(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut head = Vec::new();
+    std::fs::File::open(path)?.take(64).read_to_end(&mut head)?;
+    Ok(head)
 }
 
 fn blend_thumbnail(path: &Path) -> Result<RgbaImage, DecodeError> {
