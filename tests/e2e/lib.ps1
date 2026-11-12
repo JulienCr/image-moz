@@ -232,7 +232,7 @@ function Get-AppWindows($App) {
   $i = 0
   foreach ($line in [E2E.Native]::Windows([uint32]$App.Process.Id)) {
     $f = $line -split '\|', 6
-    if ($f[5] -like 'Image Moz*') {
+    if ($f[5] -like '*Image Moz') {
       [pscustomobject]@{
         Hwnd = [int64]$f[0]; L = [int]$f[1]; T = [int]$f[2]; R = [int]$f[3]; B = [int]$f[4]
         Width = [int]$f[3] - [int]$f[1]; Height = [int]$f[4] - [int]$f[2]; Title = $f[5]; Z = $i; Log = $App.Sandbox.Log
@@ -248,7 +248,8 @@ function Wait-AppWindows($App, [int]$Count, [int]$TimeoutMs = 10000) {
 
 # Folder name shown in a window's title (its active tab).
 function Get-ActiveFolder($Window) {
-  if ($Window.Title -match '\\([^\\]+)$') { $Matches[1] } else { $null }
+  # Title is "<folder> — Image Moz"; the dash is built from its code point to stay encoding-proof.
+  if ($Window.Title -match ('^(.+) ' + [char]0x2014 + ' Image Moz$')) { $Matches[1] } else { $null }
 }
 
 # The window currently showing `$Folder`; waits for it.
