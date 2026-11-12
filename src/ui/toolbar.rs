@@ -1,6 +1,6 @@
 use eframe::egui::{
-    Align, Align2, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame, Id, Layout, Margin, Rect, Response,
-    RichText, Sense, Shadow, Slider, Stroke, StrokeKind, TextEdit, TextFormat, Tooltip, Ui, UiBuilder, epaint::Shape, pos2,
+    Align, Align2, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Rect, Response,
+    RichText, Sense, Shadow, Stroke, StrokeKind, TextEdit, TextFormat, Tooltip, Ui, UiBuilder, epaint::Shape, pos2,
     text::LayoutJob, vec2,
 };
 
@@ -320,16 +320,51 @@ fn filter_field(ui: &mut Ui, filter: &mut String, width: f32) {
     });
 }
 
+const KNOB_RADIUS: f32 = 7.0;
+const RAIL_HEIGHT: f32 = 4.0;
+
+/// Maps a pointer x to a whole-pixel value; the knob centre travels `KNOB_RADIUS` inside the rail.
+fn value_at(x: f32, left: f32, right: f32, min: f32, max: f32) -> f32 {
+    let t = ((x - left - KNOB_RADIUS) / (right - left - 2.0 * KNOB_RADIUS)).clamp(0.0, 1.0);
+    (min + t * (max - min)).round()
+}
+
+fn knob_x(value: f32, left: f32, right: f32, min: f32, max: f32) -> f32 {
+    let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
+    left + KNOB_RADIUS + t * (right - left - 2.0 * KNOB_RADIUS)
+}
+
 fn size_slider(ui: &mut Ui, config: &mut Config, p: &Palette, width: f32) -> bool {
-    ui.spacing_mut().slider_width = width;
-    ui.spacing_mut().slider_rail_height = 4.0;
-    ui.visuals_mut().selection.bg_fill = p.accent;
-    let slider = Slider::new(&mut config.target_size, MIN_SIZE..=MAX_SIZE)
-        .step_by(1.0)
-        .show_value(false)
-        .trailing_fill(true)
-        .handle_shape(eframe::egui::style::HandleShape::Circle);
-    let response = ui.add(slider);
+    let (rect, mut response) = ui.allocate_exact_size(vec2(width, ui.spacing().interact_size.y), Sense::click_and_drag());
+    let (left, right) = (rect.left(), rect.right());
+    let before = config.target_size;
+    if let Some(pos) = response.interact_pointer_pos().filter(|_| response.is_pointer_button_down_on()) {
+        config.target_size = value_at(pos.x, left, right, MIN_SIZE, MAX_SIZE);
+    }
+    if response.has_focus() {
+        let step = ui.input(|i| i.key_pressed(Key::ArrowRight) as i8 - i.key_pressed(Key::ArrowLeft) as i8);
+        config.target_size = (config.target_size + f32::from(step)).clamp(MIN_SIZE, MAX_SIZE);
+    }
+    if config.target_size != before {
+        response.mark_changed();
+    }
+
+    let c = rect.center().y;
+    let cx = knob_x(config.target_size, left, right, MIN_SIZE, MAX_SIZE);
+    let painter = ui.painter();
+    let rail = Rect::from_min_max(pos2(left, c - RAIL_HEIGHT / 2.0), pos2(right, c + RAIL_HEIGHT / 2.0));
+    painter.rect_filled(rail, 2.0, p.slider_rail);
+    painter.rect_filled(Rect::from_min_max(rail.min, pos2(cx, rail.bottom())), 2.0, p.accent);
+
+    let center = pos2(cx, c);
+    let knob = Rect::from_center_size(center, vec2(2.0 * KNOB_RADIUS, 2.0 * KNOB_RADIUS));
+    let shadow = Shadow { offset: [0, 1], blur: p.knob_shadow_blur, spread: 0, color: p.knob_shadow };
+    painter.add(shadow.as_shape(knob, KNOB_RADIUS));
+    painter.circle(center, KNOB_RADIUS, p.knob_fill, Stroke::new(1.0, p.knob_border));
+    if response.hovered() || response.dragged() || response.has_focus() {
+        painter.circle_stroke(center, KNOB_RADIUS - 0.5, Stroke::new(1.0, p.accent.gamma_multiply(0.6)));
+    }
+
     let text = format!("Taille cible : {} px", config.target_size);
     if response.dragged() {
         Tooltip::always_open(ui.ctx().clone(), response.layer_id, response.id, eframe::egui::PopupAnchor::Pointer)
@@ -472,6 +507,16 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slider_value_and_knob_position_round_trip() {
+        assert_eq!(value_at(0.0, 0.0, 120.0, 64.0, 512.0), 64.0);
+        assert_eq!(value_at(500.0, 0.0, 120.0, 64.0, 512.0), 512.0);
+        for v in [64.0, 170.0, 300.0, 512.0] {
+            let x = knob_x(v, 10.0, 130.0, 64.0, 512.0);
+            assert!((value_at(x, 10.0, 130.0, 64.0, 512.0) - v).abs() <= 4.0);
+        }
+    }
 
     #[test]
     fn breakpoints_follow_the_spec() {
