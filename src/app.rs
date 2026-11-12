@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui::{
-    self, Color32, Context, CornerRadius, Frame, IconData, Id, Key, Margin, Modifiers, Pos2, Rect, ViewportBuilder,
+    self, Context, Frame, IconData, Id, Key, Margin, Modifiers, Pos2, Rect, ViewportBuilder,
     ViewportCommand, ViewportId, pos2, vec2,
 };
 use eframe::egui_wgpu::RenderState;
@@ -1031,12 +1031,17 @@ impl ImageMozApp {
         if !ctx.viewport_rect().contains(at) {
             return;
         }
-        let layer = egui::LayerId::new(egui::Order::Tooltip, Id::new("tab_drag_ghost"));
-        let painter = ctx.layer_painter(layer);
-        let galley = painter.layout_no_wrap(drag.label.clone(), egui::FontId::proportional(13.0), Color32::WHITE);
-        let rect = Rect::from_min_size(at + vec2(14.0, 14.0), galley.size() + vec2(16.0, 8.0));
-        painter.rect_filled(rect, CornerRadius::same(4), Color32::from_black_alpha(210));
-        painter.galley(rect.min + vec2(8.0, 4.0), galley, Color32::WHITE);
+        let kind = match drag.target {
+            Some(t) if self.windows.locate_tab(drag.tab_id).is_some_and(|(source, _)| source == t.window) => {
+                tabbar::GhostKind::Reorder
+            }
+            Some(t) => {
+                let number = self.windows.ids().iter().position(|w| *w == t.window).map_or(1, |i| i + 1);
+                tabbar::GhostKind::OtherWindow(number)
+            }
+            None => tabbar::GhostKind::NewWindow,
+        };
+        tabbar::paint_ghost(ctx, at, &drag.label, &kind);
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
     }
 
@@ -1062,7 +1067,12 @@ impl ImageMozApp {
         let (tab_events, bar_rect) = if win.tabs.is_empty() {
             (TabBarEvents::default(), None)
         } else {
+            let p = theme::palette(&ctx);
+            let frame = Frame::NONE.fill(p.chrome_bg).inner_margin(Margin::symmetric(8, 0));
             let bar = egui::Panel::top(Id::new(("tabs", id)))
+                .frame(frame)
+                .exact_size(tabbar::HEIGHT)
+                .show_separator_line(false)
                 .show(ui, |ui| tabbar::show(ui, &win.tabs, win.active, drag_view));
             (bar.inner, Some(bar.response.rect))
         };
@@ -1075,7 +1085,10 @@ impl ImageMozApp {
         let events = if previewing {
             toolbar::ToolbarEvents::default()
         } else {
+            let frame = Frame::NONE.fill(theme::palette(&ctx).toolbar_bg).inner_margin(Margin::symmetric(10, 0));
             egui::Panel::top(Id::new(("toolbar", id)))
+                .frame(frame)
+                .exact_size(toolbar::HEIGHT)
                 .show(ui, |ui| toolbar::show(ui, &mut self.config, &mut settings, &mut filter, has_tab))
                 .inner
         };
@@ -1144,6 +1157,7 @@ impl ImageMozApp {
         if let Some(index) = tab_events.close {
             self.close_tab(&ctx, index);
         }
+        self.open_requested |= tab_events.new_tab;
         if events.open || std::mem::take(&mut self.open_requested) {
             self.pick_folder(&ctx);
         }
