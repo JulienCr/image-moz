@@ -45,6 +45,9 @@ pub struct Palette {
     pub preview_bg: C,
     /// Format badge and pin backdrop (white text on top).
     pub badge_bg: C,
+    /// "+n nouvelles" section pill.
+    pub new_pill_bg: C,
+    pub new_pill_text: C,
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> C {
@@ -73,6 +76,8 @@ pub const DARK: Palette = Palette {
     tile_placeholder: rgb(28, 28, 32),
     preview_bg: rgb(18, 18, 18),
     badge_bg: C::from_black_alpha(160),
+    new_pill_bg: rgb(58, 44, 12),
+    new_pill_text: rgb(255, 207, 115),
 };
 
 pub const LIGHT: Palette = Palette {
@@ -97,6 +102,8 @@ pub const LIGHT: Palette = Palette {
     tile_placeholder: rgb(212, 212, 216),
     preview_bg: rgb(18, 18, 18),
     badge_bg: C::from_black_alpha(160),
+    new_pill_bg: rgb(255, 231, 179),
+    new_pill_text: rgb(107, 69, 0),
 };
 
 /// The user's theme setting; `System` follows the OS.
@@ -219,6 +226,7 @@ pub fn apply_style(ctx: &Context) {
         s.spacing.button_padding = vec2(10.0, 5.0);
         s.spacing.interact_size = vec2(28.0, 28.0);
         s.spacing.slider_width = 120.0;
+        s.interaction.tooltip_delay = 0.4;
     });
 }
 

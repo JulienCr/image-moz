@@ -152,7 +152,8 @@ pub fn show(ui: &mut Ui, tabs: &[Tab], active: usize, drag: DragView) -> TabBarE
                 events.tab_rects.push(rect);
             }
 
-            let plus = Rect::from_min_size(pos2(x + 2.0, row.top() + HEIGHT - 4.0 - NEW_TAB), Vec2::splat(NEW_TAB));
+            let plus_x = if tabs.is_empty() { x } else { x + 2.0 };
+            let plus = Rect::from_min_size(pos2(plus_x, row.top() + HEIGHT - 4.0 - NEW_TAB), Vec2::splat(NEW_TAB));
             let response =
                 ui.interact(plus, Id::new("new_tab"), Sense::click()).on_hover_text("Nouvel onglet (Ctrl+T)");
             if response.hovered() {

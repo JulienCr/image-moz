@@ -24,7 +24,7 @@ use crate::ui::gallery::{self, Thumbs};
 use crate::ui::empty;
 use crate::ui::preview_view;
 use crate::ui::status::{self, StatusInfo};
-use crate::ui::tabbar::{self, DragView, TabBarEvents};
+use crate::ui::tabbar::{self, DragView};
 use crate::ui::theme::{self, ThemeChoice};
 use crate::ui::toolbar;
 use crate::windows::{Change, Placement, ROOT, Step, WindowId, WindowPlan, Windows, session_plan};
@@ -1081,9 +1081,7 @@ impl ImageMozApp {
             marker: self.drag.as_ref().and_then(|d| d.target).filter(|t| t.window == id).map(|t| t.index),
         };
         let win = self.windows.state(id);
-        let (tab_events, bar_rect) = if win.tabs.is_empty() {
-            (TabBarEvents::default(), None)
-        } else {
+        let (tab_events, bar_rect) = {
             let p = theme::palette(&ctx);
             let frame = Frame::NONE.fill(p.chrome_bg).inner_margin(Margin::symmetric(8, 0));
             let bar = egui::Panel::top(Id::new(("tabs", id)))
@@ -1135,10 +1133,12 @@ impl ImageMozApp {
             live: tab.is_some_and(Tab::is_live),
             message: self.toast.as_ref().filter(|t| t.window == id).map(|t| t.text.as_str()),
         };
-        egui::Panel::bottom(Id::new(("status", id)))
-            .frame(status::frame(&ctx))
-            .exact_size(status::HEIGHT)
-            .show(ui, |ui| status::show(ui, &info));
+        if has_tab {
+            egui::Panel::bottom(Id::new(("status", id)))
+                .frame(status::frame(&ctx))
+                .exact_size(status::HEIGHT)
+                .show(ui, |ui| status::show(ui, &info));
+        }
         if previewing {
             let win = self.windows.state_mut(id);
             if let Some(tab) = win.tabs.get_mut(win.active) {
@@ -1161,7 +1161,7 @@ impl ImageMozApp {
                 }
             }
         } else {
-            let frame = Frame::NONE.fill(theme::palette(&ctx).gallery_bg).inner_margin(Margin::same(6));
+            let frame = Frame::NONE.fill(theme::palette(&ctx).gallery_bg);
             egui::CentralPanel::default().frame(frame).show(ui, |ui| self.central(ui));
         }
 

@@ -10,8 +10,10 @@ use super::preview_chrome as chrome;
 use super::theme;
 use crate::formats::{self, MediaKind};
 use crate::model::gpu::ModelRenderer;
-use crate::preview::{PreviewState, ViewTransform};
+use crate::preview::{PreviewState, ViewTransform, fit_area};
 
+/// Space kept around a fitted image, below the banner.
+const FIT_MARGIN: f32 = 8.0;
 const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 pub(super) const NOTCH_FACTOR: f32 = 1.1;
 /// Touchpads report points; this many make one wheel notch.
@@ -79,7 +81,7 @@ fn paint_content(
 
     let mut transform = match state.transform {
         Some(t) if !state.fitted => t,
-        _ => ViewTransform::fit(size, rect),
+        _ => ViewTransform::fit(size, fit_area(rect, chrome::BANNER_H, FIT_MARGIN)),
     };
     if let Some(cursor) = response.hover_pos().or(ui.input(|i| i.pointer.hover_pos())) {
         let factor = ui.input(|i| wheel_factor(&i.events));
@@ -118,11 +120,12 @@ fn show_model(ui: &mut Ui, response: &Response, rect: Rect, state: &mut PreviewS
         return;
     };
     let Some(model) = &mut state.model else { return };
+    let view = fit_area(rect, chrome::BANNER_H, 0.0);
     if response.dragged_by(PointerButton::Middle) {
         let shift = ui.input(|i| i.modifiers.shift);
         let delta = response.drag_delta();
         if shift {
-            model.pan(delta, rect.size());
+            model.pan(delta, view.size());
         } else {
             model.orbit(delta);
         }
@@ -133,7 +136,7 @@ fn show_model(ui: &mut Ui, response: &Response, rect: Rect, state: &mut PreviewS
     if notches != 0.0 {
         model.dolly(notches);
     }
-    model.paint(ui, rect, rs, renderer);
+    model.paint(ui, view, rs, renderer);
 }
 
 /// Wheel travel of this frame in notches, whatever unit the device reports.

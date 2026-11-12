@@ -13,7 +13,7 @@ use super::theme::{self, icons};
 use crate::model::UpAxis;
 use crate::preview::PreviewState;
 
-const BANNER_H: f32 = 44.0;
+pub const BANNER_H: f32 = 44.0;
 const BANNER_BG: Color32 = Color32::from_black_alpha(200);
 const OVERLAY_BG: Color32 = Color32::from_black_alpha(153);
 const TEXT: Color32 = Color32::from_rgb(0xC9, 0xC9, 0xD1);

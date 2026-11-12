@@ -187,6 +187,10 @@ fn filter_field(ui: &mut Ui, filter: &mut String, width: f32) {
     let active = focused || !filter.is_empty();
     let radius = CornerRadius::same(6);
     let fill = if active && !dark { Color32::WHITE } else { p.field_bg };
+    if focused && !dark {
+        let halo = Stroke::new(3.0, p.accent.gamma_multiply(0.15));
+        ui.painter().rect_stroke(rect, radius, halo, StrokeKind::Outside);
+    }
     ui.painter().rect_filled(rect, radius, fill);
     ui.painter().rect_stroke(
         rect,

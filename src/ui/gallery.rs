@@ -31,7 +31,6 @@ const DIMS_RELAYOUT_EVERY: Duration = Duration::from_millis(150);
 const TILE_RADIUS: u8 = 3;
 /// Loading placeholder to image cross-fade.
 const FADE_SECS: f32 = 0.12;
-const TOOLTIP_DELAY_SECS: f32 = 0.4;
 const TOOLTIP_WIDTH: f32 = 264.0;
 const TOOLTIP_IMAGE_H: f32 = 150.0;
 const FOCUS_OUTER: Color32 = Color32::from_rgb(242, 242, 245);
@@ -291,21 +290,6 @@ impl Arrivals {
     }
 }
 
-fn pill_colors(dark: bool) -> (Color32, Color32) {
-    if dark {
-        (Color32::from_rgb(58, 44, 12), Color32::from_rgb(255, 207, 115))
-    } else {
-        (Color32::from_rgb(255, 231, 179), Color32::from_rgb(107, 69, 0))
-    }
-}
-
-/// The tile tooltip appears after `TOOLTIP_DELAY_SECS`; egui keeps the delay in the shared style.
-fn ensure_tooltip_delay(ctx: &Context) {
-    if ctx.global_style().interaction.tooltip_delay != TOOLTIP_DELAY_SECS {
-        ctx.all_styles_mut(|style| style.interaction.tooltip_delay = TOOLTIP_DELAY_SECS);
-    }
-}
-
 fn semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(theme::SEMIBOLD.into()))
 }
@@ -481,7 +465,7 @@ fn draw_header(ui: &Ui, rect: Rect, hovered: bool, meta: &SectionMeta, new_count
     }
     put(count, FontId::proportional(13.0), p.text_weak);
     if new_count > 0 {
-        let (fill, ink) = pill_colors(ui.visuals().dark_mode);
+        let (fill, ink) = (p.new_pill_bg, p.new_pill_text);
         let text = nouvelles_text(new_count);
         let width = painter.layout_no_wrap(text.clone(), semibold(11.0), ink).size().x + 12.0;
         let pill = Pill { text: &text, font: semibold(11.0), fill, ink, height: 18.0 };
@@ -894,7 +878,6 @@ impl Gallery {
     }
 
     pub fn show(&mut self, ui: &mut Ui, mut view: View) -> Output {
-        ensure_tooltip_delay(ui.ctx());
         let width = ui.available_width().floor().max(1.0);
         let sig = self.signature(&view, width);
         let mut forced_offset = self.reset_scroll.then_some(0.0);
