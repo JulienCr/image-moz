@@ -1,5 +1,6 @@
 use crate::layout::{BentoRule, LayoutKind};
 use crate::library::SortOrder;
+use crate::ui::theme::ThemeChoice;
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,6 +65,7 @@ pub struct Config {
     pub layout: LayoutKind,
     pub target_size: f32,
     pub bento_rule: BentoRule,
+    pub theme: ThemeChoice,
     pub folders: BTreeMap<String, FolderState>,
     /// Pre-session fields: read once by `migrate_legacy`, never written back.
     #[serde(skip_serializing)]
@@ -81,6 +83,7 @@ impl Default for Config {
             layout: LayoutKind::default(),
             target_size: DEFAULT_SIZE,
             bento_rule: BentoRule::default(),
+            theme: ThemeChoice::default(),
             folders: BTreeMap::new(),
             last_folder: None,
             recursive: None,

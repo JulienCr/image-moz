@@ -21,6 +21,14 @@ pub struct ViewTransform {
     pub offset: Vec2,
 }
 
+/// The part of `viewport` a fitted image may occupy: below a `top_inset` banner, inside `margin`.
+pub fn fit_area(viewport: Rect, top_inset: f32, margin: f32) -> Rect {
+    let mut area = viewport;
+    area.min.y += top_inset;
+    let area = area.shrink(margin);
+    if area.width() > 0.0 && area.height() > 0.0 { area } else { viewport }
+}
+
 impl ViewTransform {
     /// Contain-fit, centered; images smaller than the viewport are upscaled too.
     pub fn fit(image: Vec2, viewport: Rect) -> Self {
@@ -83,6 +91,8 @@ pub struct PreviewState {
     /// Refit to the viewport every frame until the user zooms or pans.
     pub fitted: bool,
     pub error: Option<String>,
+    /// `Context` time of the last pointer movement; drives the help pill.
+    pub pointer_moved_at: f64,
     /// Size the transform is computed against: the original dims once known.
     pub display_size: Option<Vec2>,
     decoded: Option<Arc<RgbaImage>>,
@@ -108,6 +118,7 @@ impl PreviewState {
             transform: None,
             fitted: true,
             error: None,
+            pointer_moved_at: ctx.input(|i| i.time),
             display_size: None,
             decoded: None,
             generation: 0,
@@ -283,6 +294,17 @@ mod tests {
         assert!((r.center() - viewport().center()).length() < 1e-3);
         let tall = ViewTransform::fit(vec2(3000.0, 6000.0), viewport());
         assert!((tall.scale - 0.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fitted_image_clears_the_banner() {
+        let area = fit_area(viewport(), 44.0, 8.0);
+        assert_eq!(area.min, pos2(18.0, 72.0));
+        assert_eq!(area.max, pos2(802.0, 612.0));
+        let image = vec2(1000.0, 1000.0);
+        let r = ViewTransform::fit(image, area).image_rect(image);
+        assert!((r.min.y - 72.0).abs() < 1e-3, "tall image touches the top of the area: {}", r.min.y);
+        assert_eq!(fit_area(Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 40.0)), 44.0, 8.0).height(), 40.0);
     }
 
     #[test]

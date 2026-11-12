@@ -4,7 +4,7 @@ use eframe::egui::{Rect, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
 pub const GAP: f32 = 4.0;
-pub const HEADER_H: f32 = 28.0;
+pub const HEADER_H: f32 = 32.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Debug)]
 pub enum LayoutKind {
@@ -101,6 +101,13 @@ pub fn compute(
     }
     out.height = y;
     out
+}
+
+/// Top of a section header drawn pinned to the viewport while its section scrolls;
+/// the next header pushes it up, and it never rises above its natural position.
+pub fn sticky_y(natural_y: f32, next_header_y: Option<f32>, viewport_top: f32) -> f32 {
+    let ceiling = next_header_y.map_or(f32::INFINITY, |next| next - HEADER_H);
+    natural_y.max(viewport_top.min(ceiling))
 }
 
 fn column_count(width: f32, target: f32, min: usize) -> usize {
@@ -488,5 +495,14 @@ mod tests {
         let l = compute(LayoutKind::Grid, BentoRule::Recent, &s, 1000.0, 200.0);
         assert_eq!(neighbor(&l, 2, Dir::Down), Some(12));
         assert_eq!(neighbor(&l, 12, Dir::Up), Some(2));
+    }
+
+    #[test]
+    fn header_sticks_to_the_viewport_until_the_next_one_pushes_it() {
+        assert_eq!(sticky_y(100.0, Some(900.0), 0.0), 100.0);
+        assert_eq!(sticky_y(100.0, Some(900.0), 400.0), 400.0);
+        assert_eq!(sticky_y(100.0, Some(900.0), 880.0), 900.0 - HEADER_H);
+        assert_eq!(sticky_y(100.0, Some(900.0), 2000.0), 900.0 - HEADER_H);
+        assert_eq!(sticky_y(100.0, None, 2000.0), 2000.0);
     }
 }

@@ -4,11 +4,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use eframe::egui::epaint::RectShape;
+use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, Context, CornerRadius, CursorIcon, FontId, Id, Margin, Modifiers, Rect,
-    ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2,
+    self, Align, Align2, Color32, ColorImage, Context, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Id,
+    Layout as UiLayout, Margin, Modifiers, Painter, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind,
+    TextureHandle, TextureId, TextureOptions, Tooltip, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 
+use super::theme::{self, Palette, icons};
 use super::status;
 use crate::formats;
 use crate::config::{self, Config};
@@ -24,8 +28,15 @@ const TEXTURE_SLACK: usize = 64;
 const UPLOADS_PER_FRAME: usize = 16;
 const HIGHLIGHT: Duration = Duration::from_millis(1500);
 const DIMS_RELAYOUT_EVERY: Duration = Duration::from_millis(150);
-const PLACEHOLDER: Color32 = Color32::from_gray(44);
-const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+const TILE_RADIUS: u8 = 3;
+/// Loading placeholder to image cross-fade.
+const FADE_SECS: f32 = 0.12;
+const TOOLTIP_WIDTH: f32 = 264.0;
+const TOOLTIP_IMAGE_H: f32 = 150.0;
+const FOCUS_OUTER: Color32 = Color32::from_rgb(242, 242, 245);
+const FOCUS_INNER: Color32 = Color32::from_rgb(17, 17, 19);
+const CHECK_INK: Color32 = Color32::from_rgb(13, 26, 46);
+const ARRIVAL_INK: Color32 = Color32::from_rgb(20, 20, 22);
 
 struct Slot {
     handle: TextureHandle,
@@ -102,6 +113,7 @@ struct SectionMeta {
 
 struct TileItem {
     key: ThumbKey,
+    pinned: bool,
 }
 
 /// What the gallery reads from the app each frame.
@@ -205,6 +217,7 @@ pub struct Gallery {
     filter: String,
     /// Bumped on every rebuild of `order`.
     order_version: u64,
+    arrivals: Arrivals,
 }
 
 fn open_cache() -> DiskCache {
@@ -216,6 +229,10 @@ fn open_cache() -> DiskCache {
     })
 }
 
+fn root_name(root: &Path) -> String {
+    root.file_name().unwrap_or(root.as_os_str()).to_string_lossy().into_owned()
+}
+
 fn collapse_key(rel_dir: &str) -> String {
     if rel_dir.is_empty() { ".".to_string() } else { rel_dir.to_lowercase() }
 }
@@ -225,16 +242,259 @@ fn fit(rect: Rect, size: Vec2) -> Rect {
     Rect::from_center_size(rect.center(), size * scale)
 }
 
+/// UV rectangle that fills `cell` with an image of size `img`, cropping the overflow evenly (CSS `cover`).
+fn cover_uv(img: Vec2, cell: Vec2) -> Rect {
+    let (image_aspect, cell_aspect) = (img.x / img.y.max(1.0), cell.x / cell.y.max(1.0));
+    if image_aspect > cell_aspect {
+        let k = cell_aspect / image_aspect;
+        Rect::from_min_max(pos2((1.0 - k) / 2.0, 0.0), pos2((1.0 + k) / 2.0, 1.0))
+    } else {
+        let k = image_aspect / cell_aspect;
+        Rect::from_min_max(pos2(0.0, (1.0 - k) / 2.0), pos2(1.0, (1.0 + k) / 2.0))
+    }
+}
+
+/// Opacity of the new-arrival ring `age` after the file appeared; `None` once it has faded out.
+fn arrival_alpha(age: Duration) -> Option<f32> {
+    (age < HIGHLIGHT).then(|| 1.0 - egui::emath::easing::cubic_out(age.as_secs_f32() / HIGHLIGHT.as_secs_f32()))
+}
+
+/// `tile` widened upwards so that scrolling it into view leaves it clear of a sticky header.
+fn reveal_rect(tile: Rect, top_inset: f32) -> Rect {
+    Rect::from_min_max(pos2(tile.min.x, tile.min.y - top_inset), tile.max)
+}
+
+/// New files per section key, shown on the section header until the user has looked at it and moved on.
+#[derive(Default)]
+struct Arrivals {
+    counts: HashMap<String, usize>,
+    in_view: HashSet<String>,
+}
+
+impl Arrivals {
+    fn note(&mut self, key: String) {
+        *self.counts.entry(key).or_default() += 1;
+    }
+
+    fn count(&self, key: &str) -> usize {
+        self.counts.get(key).copied().unwrap_or(0)
+    }
+
+    /// Sections on screen last frame but not now have been seen: their count restarts from zero.
+    fn settle(&mut self, in_view: HashSet<String>) {
+        for key in self.in_view.difference(&in_view) {
+            self.counts.remove(key);
+        }
+        self.in_view = in_view;
+    }
+
+    fn clear(&mut self) {
+        self.counts.clear();
+        self.in_view.clear();
+    }
+}
+
+fn semibold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(theme::SEMIBOLD.into()))
+}
+
+fn nouvelles_text(count: usize) -> String {
+    if count == 1 { "+1 nouvelle".to_string() } else { format!("+{count} nouvelles") }
+}
+
+struct Pill<'a> {
+    text: &'a str,
+    font: FontId,
+    fill: Color32,
+    ink: Color32,
+    height: f32,
+}
+
+/// A fully rounded label whose right edge is at `right`; returns its rectangle.
+fn paint_pill(painter: &Painter, right: f32, top: f32, pill: &Pill) -> Rect {
+    const PAD: f32 = 6.0;
+    let galley = painter.layout_no_wrap(pill.text.to_string(), pill.font.clone(), pill.ink);
+    let size = vec2(galley.size().x + 2.0 * PAD, pill.height);
+    let rect = Rect::from_min_size(pos2(right - size.x, top), size);
+    painter.rect_filled(rect, CornerRadius::same((pill.height / 2.0) as u8), pill.fill);
+    painter.galley(pos2(rect.min.x + PAD, rect.center().y - galley.size().y / 2.0), galley, pill.ink);
+    rect
+}
+
 /// Format label at the bottom-left corner of a tile.
-fn draw_badge(painter: &egui::Painter, tile: Rect, label: &str) {
-    const PAD: f32 = 3.0;
-    let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(10.0), Color32::WHITE);
+fn draw_badge(painter: &Painter, tile: Rect, label: &str, p: &Palette) {
+    let format = TextFormat {
+        font_id: semibold(10.0),
+        color: Color32::WHITE,
+        extra_letter_spacing: 0.4,
+        ..Default::default()
+    };
+    let galley = painter.layout_job(LayoutJob::single_section(label.to_string(), format));
     let rect = Rect::from_min_size(
-        pos2(tile.left() + 4.0, tile.bottom() - 4.0 - galley.size().y - 2.0 * PAD),
-        galley.size() + vec2(2.0 * PAD, 2.0 * PAD),
+        pos2(tile.left() + 6.0, tile.bottom() - 6.0 - 18.0),
+        vec2(galley.size().x + 12.0, 18.0),
     );
-    painter.rect_filled(rect, CornerRadius::same(3), Color32::from_black_alpha(160));
-    painter.galley(rect.min + vec2(PAD, PAD), galley, Color32::WHITE);
+    painter.rect_filled(rect, CornerRadius::same(4), p.badge_bg);
+    painter.galley(pos2(rect.min.x + 6.0, rect.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
+}
+
+/// Pin pill at the top-right corner of a tile.
+fn draw_pin(painter: &Painter, tile: Rect, p: &Palette) {
+    let center = pos2(tile.right() - 6.0 - 11.0, tile.top() + 6.0 + 11.0);
+    painter.circle_filled(center, 11.0, p.badge_bg);
+    painter.text(center, Align2::CENTER_CENTER, icons::PUSH_PIN, theme::icon_font(12.0), Color32::WHITE);
+}
+
+/// A glyph over a short word, centred; the word is dropped when the tile is too small for it.
+fn draw_note(painter: &Painter, rect: Rect, glyph: &str, glyph_color: Color32, word: &str, word_color: Color32) {
+    let tiny = rect.width().min(rect.height()) < 64.0;
+    let size = if tiny { 20.0 } else { 28.0 };
+    let icon = painter.layout_no_wrap(glyph.to_string(), theme::icon_font(size), glyph_color);
+    let text = painter.layout_no_wrap(word.to_string(), FontId::proportional(11.5), word_color);
+    let with_word = !tiny && text.size().x + 8.0 <= rect.width();
+    let icon_h = icon.size().y;
+    let total = icon_h + if with_word { 8.0 + text.size().y } else { 0.0 };
+    let top = rect.center().y - total / 2.0;
+    painter.galley(pos2(rect.center().x - icon.size().x / 2.0, top), icon, glyph_color);
+    if with_word {
+        painter.galley(pos2(rect.center().x - text.size().x / 2.0, top + icon_h + 8.0), text, word_color);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Placeholder {
+    Loading,
+    Unreadable,
+    NoPreview,
+}
+
+struct TileLook {
+    texture: Option<(TextureId, Vec2)>,
+    /// Image opacity, 0 to 1, during the fade-in.
+    fade: f32,
+    placeholder: Placeholder,
+    badge: Option<&'static str>,
+    hovered: bool,
+    selected: bool,
+    focused: bool,
+    pinned: bool,
+    /// Ring opacity of a file that just arrived.
+    arrival: Option<f32>,
+}
+
+fn draw_tile(painter: &Painter, rect: Rect, look: &TileLook, p: &Palette) {
+    let radius = CornerRadius::same(TILE_RADIUS);
+    painter.rect_filled(rect, radius, p.tile_placeholder);
+    match (look.texture, look.placeholder) {
+        (Some((texture, size)), _) => {
+            let tint = Color32::WHITE.gamma_multiply(look.fade);
+            painter.add(RectShape::filled(rect, radius, tint).with_texture(texture, cover_uv(size, rect.size())));
+        }
+        (None, Placeholder::Unreadable) => draw_note(painter, rect, icons::WARNING, p.error, "Illisible", p.text_weak),
+        (None, Placeholder::NoPreview) => {
+            let dim = p.text_weak.gamma_multiply(0.7);
+            draw_note(painter, rect, icons::CUBE, dim, "pas d'aperçu", p.text_weak);
+        }
+        (None, Placeholder::Loading) => {}
+    }
+    if look.selected {
+        painter.rect_filled(rect, radius, p.accent.gamma_multiply(0.10));
+    } else if look.hovered {
+        painter.rect_filled(rect, radius, Color32::from_white_alpha(15));
+        painter.rect_stroke(rect, radius, Stroke::new(1.0, Color32::from_white_alpha(89)), StrokeKind::Inside);
+    }
+    if let Some(label) = look.badge {
+        draw_badge(painter, rect, label, p);
+    }
+    if look.pinned {
+        draw_pin(painter, rect, p);
+    }
+    let inner = CornerRadius::same(1);
+    match (look.selected, look.focused) {
+        (true, false) => {
+            painter.rect_stroke(rect, radius, Stroke::new(2.0, p.accent), StrokeKind::Inside);
+            let line = Stroke::new(1.0, Color32::from_black_alpha(153));
+            painter.rect_stroke(rect.shrink(2.0), inner, line, StrokeKind::Inside);
+        }
+        (false, true) => {
+            painter.rect_stroke(rect, radius, Stroke::new(2.0, FOCUS_OUTER), StrokeKind::Inside);
+            painter.rect_stroke(rect.shrink(2.0), inner, Stroke::new(2.0, FOCUS_INNER), StrokeKind::Inside);
+        }
+        (true, true) => {
+            painter.rect_stroke(rect, radius, Stroke::new(2.0, FOCUS_OUTER), StrokeKind::Inside);
+            painter.rect_stroke(rect.shrink(2.0), inner, Stroke::new(2.0, p.accent), StrokeKind::Inside);
+        }
+        (false, false) => {}
+    }
+    if look.selected {
+        let inset = if look.focused { 8.0 } else { 6.0 };
+        let center = rect.left_top() + vec2(inset + 10.0, inset + 10.0);
+        painter.circle_filled(center, 10.0, p.accent);
+        painter.text(center, Align2::CENTER_CENTER, icons::CHECK, theme::icon_font(12.0), CHECK_INK);
+    }
+    if let Some(alpha) = look.arrival {
+        painter.rect_stroke(rect, radius, Stroke::new(4.0, p.arrival.gamma_multiply(alpha)), StrokeKind::Inside);
+        if rect.width() >= 100.0 {
+            let right = rect.right() - 8.0 - if look.pinned { 26.0 } else { 0.0 };
+            let pill = Pill {
+                text: "NOUVEAU",
+                font: semibold(10.5),
+                fill: p.arrival.gamma_multiply(alpha),
+                ink: ARRIVAL_INK.gamma_multiply(alpha),
+                height: 18.0,
+            };
+            paint_pill(painter, right, rect.top() + 8.0, &pill);
+        }
+    }
+}
+
+fn draw_header(ui: &Ui, rect: Rect, hovered: bool, meta: &SectionMeta, new_count: usize, p: &Palette) {
+    let painter = ui.painter();
+    let fill = if hovered { p.status_bg.lerp_to_gamma(p.hover_bg, 0.5) } else { p.status_bg };
+    painter.rect_filled(rect, CornerRadius::ZERO, fill);
+    let mid = rect.center().y;
+    let mut x = rect.left() + 12.0;
+    let mut put = |text: String, font: FontId, color: Color32| {
+        let galley = painter.layout_no_wrap(text, font, color);
+        let width = galley.size().x;
+        painter.galley(pos2(x, mid - galley.size().y / 2.0), galley, color);
+        x += width + 8.0;
+    };
+    let caret = if meta.collapsed { icons::CARET_RIGHT } else { icons::CARET_DOWN };
+    put(caret.to_string(), theme::icon_font(10.0), if hovered { p.text } else { p.text_weak });
+    put(meta.label.clone(), FontId::new(12.5, FontFamily::Monospace), p.text);
+    let mut count = status::images_text(meta.count);
+    if meta.collapsed {
+        count.push_str(" · repliée");
+    }
+    put(count, FontId::proportional(13.0), p.text_weak);
+    if new_count > 0 {
+        let (fill, ink) = (p.new_pill_bg, p.new_pill_text);
+        let text = nouvelles_text(new_count);
+        let width = painter.layout_no_wrap(text.clone(), semibold(11.0), ink).size().x + 12.0;
+        let pill = Pill { text: &text, font: semibold(11.0), fill, ink, height: 18.0 };
+        paint_pill(painter, x + width, mid - 9.0, &pill);
+    }
+}
+
+fn tooltip_ui(ui: &mut Ui, entry: &Entry, texture: Option<(TextureId, Vec2)>, recursive: bool, p: &Palette) {
+    Frame::NONE.inner_margin(Margin::same(2)).show(ui, |ui| {
+        let width = TOOLTIP_WIDTH - ui.spacing().menu_margin.sum().x - 4.0;
+        ui.set_width(width);
+        ui.spacing_mut().item_spacing.y = 3.0;
+        if let Some((id, size)) = texture {
+            let (area, _) = ui.allocate_exact_size(vec2(width, TOOLTIP_IMAGE_H), Sense::hover());
+            let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            ui.painter().rect_filled(area, CornerRadius::same(4), p.gallery_bg);
+            ui.painter().image(id, fit(area, size), full, Color32::WHITE);
+            ui.add_space(3.0);
+        }
+        ui.add(egui::Label::new(RichText::new(&entry.name).font(semibold(13.0)).color(p.text)).truncate());
+        ui.label(RichText::new(status::meta_text(entry)).font(FontId::monospace(11.5)).color(p.text_muted));
+        if recursive && !entry.rel_dir.is_empty() {
+            ui.label(RichText::new(&entry.rel_dir).size(12.0).color(p.text_weak));
+        }
+    });
 }
 
 /// Scroll offset that puts the anchor tile back at its previous on-screen y.
@@ -393,6 +653,7 @@ impl Gallery {
             reset_scroll: false,
             filter: String::new(),
             order_version: 0,
+            arrivals: Arrivals::default(),
         }
     }
 
@@ -469,6 +730,7 @@ impl Gallery {
         self.anchor = None;
         self.scroll_y = 0.0;
         self.reset_scroll = true;
+        self.arrivals.clear();
         self.library_changed();
     }
 
@@ -487,7 +749,12 @@ impl Gallery {
         {
             self.forget_entry(thumbs, old);
         }
-        library.apply(change, now);
+        let added = library.apply(change, now);
+        if let (true, FsChange::Upsert(path)) = (added, change)
+            && let Some(entry) = library.get(path)
+        {
+            self.arrivals.note(collapse_key(&entry.rel_dir));
+        }
         self.library_changed();
     }
 
@@ -498,6 +765,9 @@ impl Gallery {
             if !kept.contains(&key_for(&old.path, old.mtime, old.size)) {
                 self.forget_entry(thumbs, old);
             }
+        }
+        for entry in entries.iter().filter(|e| e.arrived_at.is_some() && library.get(&e.path).is_none()) {
+            self.arrivals.note(collapse_key(&entry.rel_dir));
         }
         library.replace_all(entries);
         self.library_changed();
@@ -568,11 +838,11 @@ impl Gallery {
                         pixels,
                         pinned,
                     });
-                    self.items.push(TileItem { key: key_for(path, entry.mtime, entry.size) });
+                    self.items.push(TileItem { key: key_for(path, entry.mtime, entry.size), pinned });
                     self.order.push(path.clone());
                 }
             }
-            let label = if section.rel_dir.is_empty() { ".".to_string() } else { section.rel_dir.clone() };
+            let label = if section.rel_dir.is_empty() { root_name(view.root) } else { section.rel_dir.clone() };
             layout_sections.push(LayoutSection {
                 header: (view.recursive && !view.flat).then(|| label.clone()),
                 collapsed: is_collapsed,
@@ -649,7 +919,8 @@ impl Gallery {
         let scroll = area.show_viewport(ui, |ui, viewport| {
             if let Some(tile) = view.scroll_to.and_then(|id| self.layout.tiles.iter().find(|t| t.id == id)) {
                 let origin = ui.max_rect().min.to_vec2();
-                ui.scroll_to_rect(tile.rect.translate(origin), None);
+                let inset = if self.layout.headers.is_empty() { 0.0 } else { layout::HEADER_H + layout::GAP };
+                ui.scroll_to_rect(reveal_rect(tile.rect, inset).translate(origin), None);
             }
             self.draw(ui, viewport, &mut view, width, &mut out, &mut toggled);
         });
@@ -664,16 +935,34 @@ impl Gallery {
             out.config_changed = true;
         }
         if self.match_count() == Some(0) {
-            let color = ui.visuals().weak_text_color();
-            ui.painter().text(
-                scroll.inner_rect.center(),
-                Align2::CENTER_CENTER,
-                "Aucun fichier ne correspond au filtre",
-                FontId::proportional(14.0),
-                color,
-            );
+            self.empty_filter(ui, scroll.inner_rect, view.library.len());
         }
         out
+    }
+
+    fn empty_filter(&mut self, ui: &mut Ui, area: Rect, total: usize) {
+        let p = theme::palette(ui.ctx());
+        let mut clear = false;
+        let builder = UiBuilder::new().max_rect(area).layout(UiLayout::top_down(Align::Center));
+        ui.scope_builder(builder, |ui| {
+            let label = |ui: &mut Ui, text: RichText| ui.add(egui::Label::new(text).selectable(false));
+            ui.spacing_mut().item_spacing.y = 12.0;
+            ui.add_space(((area.height() - 150.0) / 2.0).max(0.0));
+            label(ui, RichText::new(icons::MAGNIFYING_GLASS).font(theme::icon_font(36.0)).color(p.text_weak.gamma_multiply(0.6)));
+            label(ui, RichText::new("Aucun fichier ne correspond au filtre").font(semibold(15.0)).color(p.text));
+            let line = format!("« {} » · 0 sur {}", self.filter.trim(), status::images_text(total));
+            label(ui, RichText::new(line).size(12.5).color(p.text_weak));
+            let button = egui::Button::new(RichText::new("Effacer le filtre").color(p.text))
+                .fill(p.button_fill)
+                .stroke(Stroke::new(1.0, p.border))
+                .corner_radius(CornerRadius::same(6))
+                .min_size(vec2(0.0, 30.0));
+            clear = ui.add(button).clicked();
+        });
+        if clear {
+            self.set_filter("");
+            ui.ctx().request_repaint();
+        }
     }
 
     fn anchored_offset_after_relayout(&self) -> Option<f32> {
@@ -697,51 +986,13 @@ impl Gallery {
         let origin = content.min.to_vec2();
         let near = viewport.expand2(vec2(0.0, viewport.height()));
         let recursive = view.recursive;
+        let p = theme::palette(ui.ctx());
         let now = Instant::now();
-        let mut fading = false;
+        let mut arriving = false;
         let mut first: Option<(f32, f32, usize)> = None;
         let mut near_tiles = 0;
         let mut near_jobs: Vec<ThumbJob> = Vec::new();
         let mut far_jobs: Vec<(f32, ThumbJob)> = Vec::new();
-
-        for header in &self.layout.headers {
-            if !header.rect.intersects(viewport) {
-                continue;
-            }
-            let rect = header.rect.translate(origin);
-            let meta = &self.meta[header.section];
-            let response = ui
-                .interact(rect, Id::new(("section_header", header.section)), Sense::click())
-                .on_hover_cursor(CursorIcon::PointingHand);
-            let visuals = ui.visuals();
-            let fill = if response.hovered() {
-                visuals.widgets.hovered.weak_bg_fill
-            } else {
-                visuals.widgets.inactive.weak_bg_fill
-            };
-            let text_color = visuals.strong_text_color();
-            let weak = visuals.weak_text_color();
-            let painter = ui.painter();
-            painter.rect_filled(rect, CornerRadius::same(3), fill);
-            let arrow = if meta.collapsed { "▶" } else { "▼" };
-            let title = painter.text(
-                rect.left_center() + vec2(8.0, 0.0),
-                Align2::LEFT_CENTER,
-                format!("{arrow}  {}", meta.label),
-                FontId::proportional(14.0),
-                text_color,
-            );
-            painter.text(
-                pos2(title.right() + 10.0, rect.center().y),
-                Align2::LEFT_CENTER,
-                status::images_text(meta.count),
-                FontId::proportional(12.0),
-                weak,
-            );
-            if response.clicked() {
-                *toggled = Some(meta.key.clone());
-            }
-        }
 
         for tile in &self.layout.tiles {
             let rect = tile.rect.translate(origin);
@@ -776,51 +1027,29 @@ impl Gallery {
             }
 
             let response = ui.interact(rect, Id::new(("tile", id)), Sense::click());
-            let painter = ui.painter();
-            painter.rect_filled(rect, CornerRadius::same(2), PLACEHOLDER);
-            if let Some(texture) = view.thumbs.textures.get(key) {
-                painter.image(texture.id(), fit(rect, texture.size_vec2()), FULL_UV, Color32::WHITE);
-            } else if entry.is_some_and(|e| e.error) {
-                painter.text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    "⚠",
-                    FontId::proportional(28.0),
-                    Color32::from_rgb(230, 160, 40),
-                );
-            } else if entry.is_some_and(|e| e.no_preview) {
-                painter.text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    "pas d'aperçu",
-                    FontId::proportional(13.0),
-                    ui.visuals().weak_text_color(),
-                );
-            }
-            if let Some(label) = formats::badge(path) {
-                draw_badge(painter, rect, label);
-            }
-            let accent = Color32::from_rgb(70, 140, 255);
-            if view.selection.contains(id) {
-                painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(2.0, accent), StrokeKind::Inside);
-            }
-            if view.selection.focus() == Some(id) {
-                painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(4.0, accent), StrokeKind::Inside);
-            }
-            if let Some(arrived) = entry.and_then(|e| e.arrived_at) {
-                let age = now.saturating_duration_since(arrived);
-                if age < HIGHLIGHT {
-                    let fade = 1.0 - age.as_secs_f32() / HIGHLIGHT.as_secs_f32();
-                    let alpha = (fade * 255.0) as u8;
-                    painter.rect_stroke(
-                        rect,
-                        CornerRadius::same(2),
-                        Stroke::new(4.0, Color32::from_rgba_unmultiplied(255, 200, 40, alpha)),
-                        StrokeKind::Inside,
-                    );
-                    fading = true;
-                }
-            }
+            let texture = view.thumbs.textures.get(key).map(|t| (t.id(), t.size_vec2()));
+            let placeholder = match entry {
+                Some(e) if e.error => Placeholder::Unreadable,
+                Some(e) if e.no_preview => Placeholder::NoPreview,
+                _ => Placeholder::Loading,
+            };
+            let arrival = entry
+                .and_then(|e| e.arrived_at)
+                .and_then(|at| arrival_alpha(now.saturating_duration_since(at)));
+            arriving |= arrival.is_some();
+            let look = TileLook {
+                texture,
+                fade: ui.ctx().animate_bool_with_time(Id::new(("tile_fade", key)), texture.is_some(), FADE_SECS),
+                placeholder,
+                badge: formats::badge(path),
+                hovered: response.hovered(),
+                selected: view.selection.contains(id),
+                focused: view.selection.focus() == Some(id),
+                pinned: self.items[id].pinned,
+                arrival,
+            };
+            draw_tile(ui.painter(), rect, &look, p);
+
             if response.hovered() {
                 out.hovered = Some(path.clone());
             }
@@ -839,18 +1068,44 @@ impl Gallery {
                 }
             });
             if let Some(entry) = entry {
-                response.on_hover_ui(|ui| {
-                    ui.label(egui::RichText::new(&entry.name).strong());
-                    ui.label(status::meta_text(entry));
-                    if recursive {
-                        ui.label(status::rel_dir_label(entry));
-                    }
-                });
+                Tooltip::for_enabled(&response)
+                    .at_pointer()
+                    .gap(12.0)
+                    .show(|ui| tooltip_ui(ui, entry, texture, recursive, p));
             }
         }
 
+        // Headers go last so they sit on top of the tiles, in drawing and in hit order.
+        let headers = &self.layout.headers;
+        let mut seen = HashSet::new();
+        for (i, header) in headers.iter().enumerate() {
+            let next_y = headers.get(i + 1).map(|h| h.rect.min.y);
+            let meta = &self.meta[header.section];
+            let end = next_y.unwrap_or(self.layout.height);
+            if Rect::from_min_max(pos2(0.0, header.rect.min.y), pos2(width, end)).intersects(viewport) {
+                seen.insert(meta.key.clone());
+            }
+            let y = layout::sticky_y(header.rect.min.y, next_y, viewport.min.y);
+            let rel = Rect::from_min_size(pos2(header.rect.min.x, y), header.rect.size());
+            if !rel.intersects(viewport) {
+                continue;
+            }
+            let rect = rel.translate(origin);
+            let id = Id::new(("section_header", self.id, header.section));
+            let response = ui.interact(rect, id, Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+            draw_header(ui, rect, response.hovered(), meta, self.arrivals.count(&meta.key), p);
+            if response.clicked() {
+                *toggled = Some(meta.key.clone());
+            }
+        }
+        if headers.is_empty() {
+            self.arrivals.clear();
+        } else {
+            self.arrivals.settle(seen);
+        }
+
         self.anchor = first.map(|(y, _, id)| (self.order[id].clone(), y - viewport.min.y));
-        if fading {
+        if arriving {
             ui.ctx().request_repaint();
         }
         far_jobs.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -882,6 +1137,78 @@ mod tests {
         assert_eq!(wide.center(), tile.center());
         let tall = fit(tile, vec2(50.0, 200.0));
         assert_eq!(tall.size(), vec2(25.0, 100.0));
+    }
+
+    #[test]
+    fn cover_crops_the_longer_side_and_centres_it() {
+        let wide = cover_uv(vec2(200.0, 100.0), vec2(100.0, 100.0));
+        assert_eq!((wide.min, wide.max), (pos2(0.25, 0.0), pos2(0.75, 1.0)));
+        let tall = cover_uv(vec2(100.0, 200.0), vec2(100.0, 100.0));
+        assert_eq!((tall.min, tall.max), (pos2(0.0, 0.25), pos2(1.0, 0.75)));
+        let exact = cover_uv(vec2(512.0, 256.0), vec2(300.0, 150.0));
+        assert_eq!((exact.min, exact.max), (pos2(0.0, 0.0), pos2(1.0, 1.0)));
+    }
+
+    #[test]
+    fn arrival_ring_fades_out_over_the_highlight() {
+        assert_eq!(arrival_alpha(Duration::ZERO), Some(1.0));
+        let mid = arrival_alpha(HIGHLIGHT / 2).unwrap();
+        assert!(mid > 0.0 && mid < 1.0);
+        assert!(arrival_alpha(HIGHLIGHT - Duration::from_millis(1)).unwrap() < 0.01);
+        assert_eq!(arrival_alpha(HIGHLIGHT), None);
+    }
+
+    #[test]
+    fn revealed_tile_clears_the_sticky_header() {
+        let tile = Rect::from_min_size(pos2(10.0, 500.0), vec2(100.0, 100.0));
+        let wanted = reveal_rect(tile, 36.0);
+        assert_eq!((wanted.min, wanted.max), (pos2(10.0, 464.0), tile.max));
+        assert_eq!(reveal_rect(tile, 0.0), tile);
+    }
+
+    #[test]
+    fn arrivals_stay_until_the_section_was_seen_and_left() {
+        let keys = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<HashSet<_>>();
+        let mut arrivals = Arrivals::default();
+        arrivals.note("a".into());
+        arrivals.note("a".into());
+        arrivals.note("b".into());
+        arrivals.settle(keys(&["a"]));
+        assert_eq!((arrivals.count("a"), arrivals.count("b")), (2, 1));
+        arrivals.note("a".into());
+        arrivals.settle(keys(&["a", "b"]));
+        assert_eq!((arrivals.count("a"), arrivals.count("b")), (3, 1));
+        arrivals.settle(keys(&["b"]));
+        assert_eq!((arrivals.count("a"), arrivals.count("b")), (0, 1));
+        arrivals.settle(keys(&[]));
+        assert_eq!(arrivals.count("b"), 0);
+    }
+
+    #[test]
+    fn new_files_are_counted_by_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("Sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        write_image(&dir.path().join("old.png"));
+        let (_ctx, mut thumbs, mut gallery) = test_thumbs(dir.path());
+        let mut library = Library::new(dir.path().to_path_buf(), true);
+        library.replace_all(crate::library::scan(dir.path(), true).unwrap());
+
+        let fresh = sub.join("new.png");
+        write_image(&fresh);
+        gallery.apply_change(&mut thumbs, &mut library, &FsChange::Upsert(fresh.clone()), Instant::now());
+        assert_eq!((gallery.arrivals.count("sub"), gallery.arrivals.count(".")), (1, 0));
+        gallery.apply_change(&mut thumbs, &mut library, &FsChange::Upsert(fresh), Instant::now());
+        assert_eq!(gallery.arrivals.count("sub"), 1);
+
+        let late = dir.path().join("late.png");
+        write_image(&late);
+        let mut scanned = crate::library::scan(dir.path(), true).unwrap();
+        for entry in scanned.iter_mut().filter(|e| e.path == late) {
+            entry.arrived_at = Some(Instant::now());
+        }
+        gallery.replace_entries(&mut thumbs, &mut library, scanned);
+        assert_eq!(gallery.arrivals.count("."), 1);
     }
 
     #[test]
@@ -1000,6 +1327,8 @@ mod tests {
 
     fn test_thumbs(dir: &Path) -> (Context, Thumbs, Gallery) {
         let ctx = Context::default();
+        theme::install_fonts(&ctx);
+        let _ = ctx.run_ui(Default::default(), |_| {});
         let cache = DiskCache::open(dir.join("cache")).unwrap();
         (ctx.clone(), Thumbs::with_cache(&ctx, cache), Gallery::new())
     }

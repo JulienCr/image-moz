@@ -184,6 +184,11 @@ impl Tab {
         }
     }
 
+    /// The watcher is armed and its folder still there.
+    pub fn is_live(&self) -> bool {
+        self.watcher.is_some() && self.folder_issue.is_none()
+    }
+
     pub fn is_scanning(&self) -> bool {
         self.scan.is_some()
     }
