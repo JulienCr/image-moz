@@ -1,4 +1,6 @@
-use eframe::egui::{self, Align, Label, Layout, Ui};
+use eframe::egui::{Align, Color32, Context, Frame, Label, Layout, Margin, RichText, Sense, Ui, vec2};
+
+use super::theme;
 
 use crate::formats::{self, MediaKind};
 use crate::library::Entry;
@@ -60,17 +62,6 @@ pub fn meta_text(entry: &Entry) -> String {
     }
 }
 
-pub fn summary(entry: &Entry, recursive: bool) -> String {
-    let mut text = format!("{}  ·  {}", entry.name, meta_text(entry));
-    if recursive {
-        text.push_str(&format!("  ·  {}", rel_dir_label(entry)));
-    }
-    if entry.error {
-        text.push_str("  ·  ⚠ illisible");
-    }
-    text
-}
-
 pub fn images_text(count: usize) -> String {
     if count == 1 { "1 image".to_string() } else { format!("{count} images") }
 }
@@ -87,27 +78,86 @@ pub struct StatusInfo<'a> {
     pub matching: Option<usize>,
     pub selected: usize,
     pub loading: bool,
+    /// The folder watcher is running.
+    pub live: bool,
     /// Transient notice; replaces the entry summary while set.
     pub message: Option<&'a str>,
 }
 
+pub const HEIGHT: f32 = 30.0;
+const TEXT_SIZE: f32 = 12.5;
+const MONO_SIZE: f32 = 12.0;
+
+pub fn frame(ctx: &Context) -> Frame {
+    Frame::NONE.fill(theme::palette(ctx).status_bg).inner_margin(Margin::symmetric(12, 0))
+}
+
+pub fn count_text(total: usize, matching: Option<usize>) -> String {
+    match matching {
+        Some(n) => format!("{n} / {} (filtre)", images_text(total)),
+        None => images_text(total),
+    }
+}
+
+fn text(s: impl Into<String>, color: Color32) -> RichText {
+    RichText::new(s.into()).size(TEXT_SIZE).color(color)
+}
+
+fn mono(s: impl Into<String>, color: Color32) -> RichText {
+    RichText::new(s.into()).monospace().size(MONO_SIZE).color(color)
+}
+
+fn live_dot(ui: &mut Ui, live: bool) {
+    let p = theme::palette(ui.ctx());
+    let color = if live { p.arrival } else { p.text_weak.gamma_multiply(0.5) };
+    ui.spacing_mut().item_spacing.x = 6.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(7.0, 7.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, color);
+    ui.label(text("En direct", p.text_weak));
+}
+
+fn divider(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(vec2(1.0, 14.0), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, theme::palette(ui.ctx()).border);
+}
+
+fn entry_info(ui: &mut Ui, entry: &Entry, recursive: bool) {
+    let p = theme::palette(ui.ctx());
+    ui.add(Label::new(text(&entry.name, p.text).strong()).truncate());
+    let dims = dims_text(entry);
+    if !dims.is_empty() {
+        ui.label(mono(dims, p.text_muted));
+    }
+    ui.label(mono(format_size(entry.size), p.text_muted));
+    if recursive {
+        ui.label(text(rel_dir_label(entry), p.text_weak));
+    }
+    if entry.error {
+        ui.label(text(format!("{} illisible", theme::icons::WARNING), p.error));
+    }
+}
+
 pub fn show(ui: &mut Ui, info: &StatusInfo) {
-    ui.horizontal(|ui| {
+    let p = theme::palette(ui.ctx());
+    ui.set_height(HEIGHT);
+    ui.horizontal_centered(|ui| {
+        ui.spacing_mut().item_spacing.x = 14.0;
+        live_dot(ui, info.live);
+        divider(ui);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(selected_text(info.selected));
-            ui.separator();
-            match info.matching {
-                Some(n) => ui.label(format!("{n} / {}", images_text(info.total))),
-                None => ui.label(images_text(info.total)),
-            };
-            ui.separator();
-            if let Some(message) = info.message {
-                ui.add(Label::new(message).truncate());
-            } else if let Some(entry) = info.entry {
-                ui.add(Label::new(summary(entry, info.recursive)).truncate());
-            } else if info.loading {
-                ui.label(egui::RichText::new("Chargement…").weak());
+            if info.selected > 0 {
+                ui.label(text(selected_text(info.selected), p.accent));
             }
+            ui.label(text(count_text(info.total, info.matching), p.text_muted));
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                if let Some(message) = info.message {
+                    ui.add(Label::new(text(message, p.text)).truncate());
+                } else if let Some(entry) = info.entry {
+                    entry_info(ui, entry, info.recursive);
+                } else if info.loading {
+                    ui.label(text("Chargement…", p.text_weak));
+                }
+            });
         });
     });
 }
@@ -145,15 +195,6 @@ mod tests {
     }
 
     #[test]
-    fn summary_shows_rel_dir_only_when_recursive() {
-        let e = entry(2048, Some((640, 480)), "");
-        assert_eq!(summary(&e, false), "a.png  ·  640 × 480  ·  2,0 Ko");
-        assert_eq!(summary(&e, true), "a.png  ·  640 × 480  ·  2,0 Ko  ·  .");
-        let e = entry(10, None, "sub/deep");
-        assert_eq!(summary(&e, true), "a.png  ·  ? × ?  ·  10 o  ·  sub/deep");
-    }
-
-    #[test]
     fn triangle_text() {
         assert_eq!(triangles_text(Some(12345)), "12\u{202F}345 triangles");
         assert_eq!(triangles_text(Some(1)), "1 triangle");
@@ -174,6 +215,12 @@ mod tests {
         e.path = PathBuf::from("a.glb");
         e.triangles = Some(12);
         assert_eq!(meta_text(&e), "12 triangles  ·  2,0 Ko");
+    }
+
+    #[test]
+    fn count_text_marks_the_filter() {
+        assert_eq!(count_text(328, None), "328 images");
+        assert_eq!(count_text(48, Some(17)), "17 / 48 images (filtre)");
     }
 
     #[test]

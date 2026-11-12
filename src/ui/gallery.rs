@@ -9,7 +9,7 @@ use eframe::egui::{
     ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2,
 };
 
-use super::status;
+use super::{status, theme};
 use crate::formats;
 use crate::config::{self, Config};
 use crate::layout::{self, BentoRule, Layout, LayoutItem, LayoutKind, LayoutSection};
@@ -24,7 +24,6 @@ const TEXTURE_SLACK: usize = 64;
 const UPLOADS_PER_FRAME: usize = 16;
 const HIGHLIGHT: Duration = Duration::from_millis(1500);
 const DIMS_RELAYOUT_EVERY: Duration = Duration::from_millis(150);
-const PLACEHOLDER: Color32 = Color32::from_gray(44);
 const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
 struct Slot {
@@ -777,7 +776,7 @@ impl Gallery {
 
             let response = ui.interact(rect, Id::new(("tile", id)), Sense::click());
             let painter = ui.painter();
-            painter.rect_filled(rect, CornerRadius::same(2), PLACEHOLDER);
+            painter.rect_filled(rect, CornerRadius::same(2), theme::palette(ui.ctx()).tile_placeholder);
             if let Some(texture) = view.thumbs.textures.get(key) {
                 painter.image(texture.id(), fit(rect, texture.size_vec2()), FULL_UV, Color32::WHITE);
             } else if entry.is_some_and(|e| e.error) {

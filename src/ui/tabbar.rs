@@ -1,9 +1,9 @@
-use eframe::egui::{Button, Color32, PointerButton, Rect, RichText, ScrollArea, Sense, Stroke, Ui, pos2};
+use eframe::egui::{Button, PointerButton, Rect, RichText, ScrollArea, Sense, Stroke, Ui, pos2};
 
+use super::theme;
 use crate::tab::Tab;
 
 const MAX_LABEL_WIDTH: f32 = 180.0;
-const MARKER_COLOR: Color32 = Color32::from_rgb(70, 140, 255);
 
 #[derive(Default)]
 pub struct TabBarEvents {
@@ -75,6 +75,6 @@ fn paint_marker(ui: &Ui, tabs: &[Rect], at: usize) {
         Some(next) => (next.min.x, next),
         None => (last.max.x, last),
     };
-    let stroke = Stroke::new(2.0, MARKER_COLOR);
+    let stroke = Stroke::new(2.0, theme::palette(ui.ctx()).accent);
     ui.painter().line_segment([pos2(x, rect.min.y), pos2(x, rect.max.y)], stroke);
 }

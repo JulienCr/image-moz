@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,6 +24,7 @@ use crate::ui::gallery::{self, Thumbs};
 use crate::ui::preview_view;
 use crate::ui::status::{self, StatusInfo};
 use crate::ui::tabbar::{self, DragView, TabBarEvents};
+use crate::ui::theme::{self, ThemeChoice};
 use crate::ui::toolbar;
 use crate::windows::{Change, Placement, ROOT, Step, WindowId, WindowPlan, Windows, session_plan};
 
@@ -135,6 +136,8 @@ pub struct ImageMozApp {
     closing: Vec<WindowId>,
     open_requested: bool,
     toast: Option<Toast>,
+    /// Theme last sent to each window's native title bar.
+    native_theme: HashMap<WindowId, ThemeChoice>,
     pending_copy: Option<PendingCopy>,
     instance: Option<Primary>,
     published_target: isize,
@@ -213,25 +216,13 @@ fn px_rect(rect: Rect, scale: f32) -> PxRect {
     PxRect { left: px(rect.min.x), top: px(rect.min.y), right: px(rect.max.x), bottom: px(rect.max.y) }
 }
 
-/// The bundled fonts lack arrows (↓ ↑ →); Segoe UI Symbol covers them on Windows.
-fn install_symbol_font(ctx: &Context) {
-    let windir = std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into());
-    let path = PathBuf::from(windir).join("Fonts").join("seguisym.ttf");
-    let Ok(bytes) = std::fs::read(&path) else {
-        log::warn!("symbol font not found at {}", path.display());
-        return;
-    };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("symbols".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-        family.push("symbols".into());
-    }
-    ctx.set_fonts(fonts);
-}
-
+/// The folder's own name (also for UNC and WSL paths), then the app name.
 fn window_title(root: Option<&Path>) -> String {
     match root {
-        Some(root) => format!("{APP_NAME} — {}", root.display()),
+        Some(root) => {
+            let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
+            format!("{name} — {APP_NAME}")
+        }
         None => APP_NAME.to_string(),
     }
 }
@@ -240,12 +231,13 @@ impl ImageMozApp {
     pub fn new(cc: &eframe::CreationContext, startup: Startup, cli: Option<OpenTarget>, instance: Option<Primary>) -> Self {
         // Ctrl+= / Ctrl+- resize the thumbnails here, not the whole UI.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        install_symbol_font(&cc.egui_ctx);
         if let Some(instance) = &instance {
             instance.set_wake(wake(&cc.egui_ctx));
         }
         let Startup { config, plans, active_window, icon, monitors, scale, root_placement } = startup;
         let ctx = &cc.egui_ctx;
+        theme::install_fonts(ctx);
+        theme::apply(ctx, config.theme);
         let mut windows = Windows::default();
         let mut ids = Vec::new();
         for (i, plan) in plans.iter().enumerate() {
@@ -297,6 +289,7 @@ impl ImageMozApp {
             closing: Vec::new(),
             open_requested: false,
             toast: None,
+            native_theme: HashMap::new(),
             pending_copy: None,
             instance,
             published_target: 0,
@@ -623,6 +616,10 @@ impl ImageMozApp {
             self.open_path(ctx, &path);
         }
 
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::L)) {
+            self.cycle_theme(ctx);
+        }
+
         match ctx.input_mut(tab_shortcut) {
             Some(TabShortcut::New) => self.open_requested = true,
             Some(TabShortcut::CloseActive) => self.close_tab(ctx, self.windows.state(self.cur).active),
@@ -813,6 +810,13 @@ impl ImageMozApp {
             self.config.toggle_pin(&tab.root, &path);
             self.touch_config();
         }
+    }
+
+    fn cycle_theme(&mut self, ctx: &Context) {
+        self.config.theme = self.config.theme.next();
+        theme::apply(ctx, self.config.theme);
+        self.touch_config();
+        self.notify(ctx, self.cur, format!("Thème : {}", self.config.theme.label()));
     }
 
     fn notify(&mut self, ctx: &Context, window: WindowId, text: String) {
@@ -1043,6 +1047,9 @@ impl ImageMozApp {
         let screen = self.observe_window(&ctx, id);
         self.handle_input(&ctx);
         self.sync_title(&ctx, id);
+        if self.native_theme.insert(id, self.config.theme) != Some(self.config.theme) {
+            theme::sync_native(&ctx, ctx.viewport_id(), self.config.theme);
+        }
         if let Some(tab) = self.windows.state_mut(id).active_tab_mut() {
             tab.sync_preview();
         }
@@ -1095,15 +1102,19 @@ impl ImageMozApp {
             matching: tab.and_then(|t| t.gallery.match_count()),
             selected: tab.map_or(0, |t| t.selection.len()),
             loading: tab.is_some_and(Tab::is_scanning),
+            live: tab.is_some_and(Tab::is_live),
             message: self.toast.as_ref().filter(|t| t.window == id).map(|t| t.text.as_str()),
         };
-        egui::Panel::bottom(Id::new(("status", id))).show(ui, |ui| status::show(ui, &info));
+        egui::Panel::bottom(Id::new(("status", id)))
+            .frame(status::frame(&ctx))
+            .exact_size(status::HEIGHT)
+            .show(ui, |ui| status::show(ui, &info));
         if previewing {
             let win = self.windows.state_mut(id);
             if let Some(tab) = win.tabs.get_mut(win.active) {
                 let thumb = tab.preview.as_ref().and_then(|p| tab.gallery.thumbnail(&mut self.thumbs, p.index));
                 let gpu = self.render_state.as_ref().zip(self.model_renderer.as_ref());
-                let frame = Frame::NONE.fill(preview_view::BACKGROUND);
+                let frame = Frame::NONE.fill(theme::palette(&ctx).preview_bg);
                 egui::CentralPanel::default().frame(frame).show(ui, |ui| {
                     if let Some(preview) = &mut tab.preview {
                         preview.poll(&ctx);
@@ -1112,7 +1123,7 @@ impl ImageMozApp {
                 });
             }
         } else {
-            let frame = Frame::NONE.fill(ctx.global_style().visuals.panel_fill).inner_margin(Margin::same(6));
+            let frame = Frame::NONE.fill(theme::palette(&ctx).gallery_bg).inner_margin(Margin::same(6));
             egui::CentralPanel::default().frame(frame).show(ui, |ui| self.central(ui));
         }
 
@@ -1276,6 +1287,7 @@ mod tests {
     #[test]
     fn title_names_the_app_and_the_active_folder() {
         assert_eq!(window_title(None), "Image Moz");
-        assert_eq!(window_title(Some(Path::new(r"D:\Pics"))), "Image Moz — D:\\Pics");
+        assert_eq!(window_title(Some(Path::new(r"D:\Pics"))), "Pics — Image Moz");
+        assert_eq!(window_title(Some(Path::new(r"\\wsl.localhost\Ubuntu\home\me\img"))), "img — Image Moz");
     }
 }

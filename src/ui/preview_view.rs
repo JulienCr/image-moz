@@ -6,12 +6,12 @@ use eframe::egui::{
 };
 use eframe::egui_wgpu::RenderState;
 
+use super::theme;
 use crate::formats::{self, MediaKind};
 use crate::model::gpu::ModelRenderer;
 use crate::preview::{PreviewState, ViewTransform};
 
 const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-pub const BACKGROUND: Color32 = Color32::from_gray(18);
 const NOTCH_FACTOR: f32 = 1.1;
 /// Touchpads report points; this many make one wheel notch.
 const POINTS_PER_NOTCH: f32 = 40.0;
@@ -24,7 +24,7 @@ pub fn show(ui: &mut Ui, state: &mut PreviewState, thumb: Option<&TextureHandle>
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, BACKGROUND);
+    painter.rect_filled(rect, 0.0, theme::palette(ui.ctx()).preview_bg);
 
     let texture = state.image.as_ref().or(thumb);
     if let Some(message) = &state.error {
