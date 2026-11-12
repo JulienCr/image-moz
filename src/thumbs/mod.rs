@@ -40,6 +40,8 @@ pub struct Thumb {
     /// Long side at most `THUMB_SIZE`.
     pub image: image::RgbaImage,
     pub orig_dims: (u32, u32),
+    /// Triangle count of a 3D model; `None` for everything else.
+    pub triangles: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -52,6 +54,8 @@ pub enum ThumbOutcome {
     Ready(Thumb),
     Dims((u32, u32)),
     Failed,
+    /// The file is valid but carries nothing to show (a `.blend` without thumbnail).
+    NoPreview,
 }
 
 pub struct ThumbResult {

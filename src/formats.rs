@@ -2,9 +2,27 @@ use std::path::Path;
 
 use image::{Rgba32FImage, RgbaImage};
 
+use crate::blend::{self, BlendError};
+use crate::model::offscreen::{MODEL_RENDER_SIZE, Offscreen};
+use crate::model::{self, ModelError};
+
 const EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "exr", "hdr",
 ];
+const MODEL_EXTENSIONS: &[&str] = &["glb", "gltf", "obj", "stl", "3mf"];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaKind {
+    Image,
+    Model,
+    Blend,
+}
+
+/// A decoded file; `triangles` is set for 3D models only.
+pub struct Decoded {
+    pub image: RgbaImage,
+    pub triangles: Option<u32>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
@@ -14,6 +32,14 @@ pub enum DecodeError {
     Image(#[from] image::ImageError),
     #[error("unsupported format")]
     Unsupported,
+    #[error("model error: {0}")]
+    Model(#[from] ModelError),
+    #[error("gpu error: {0}")]
+    Gpu(String),
+    #[error("blend error: {0}")]
+    Blend(#[from] BlendError),
+    #[error("no embedded preview")]
+    NoPreview,
 }
 
 fn extension(path: &Path) -> Option<String> {
@@ -22,22 +48,65 @@ fn extension(path: &Path) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
+pub fn kind(path: &Path) -> Option<MediaKind> {
+    let ext = extension(path)?;
+    if EXTENSIONS.contains(&ext.as_str()) {
+        Some(MediaKind::Image)
+    } else if MODEL_EXTENSIONS.contains(&ext.as_str()) {
+        Some(MediaKind::Model)
+    } else if ext == "blend" {
+        Some(MediaKind::Blend)
+    } else {
+        None
+    }
+}
+
 pub fn is_supported(path: &Path) -> bool {
-    extension(path).is_some_and(|e| EXTENSIONS.contains(&e.as_str()))
+    kind(path).is_some()
 }
 
+/// Upper-case extension shown on tiles of non-image files.
+pub fn badge(path: &Path) -> Option<&'static str> {
+    match extension(path)?.as_str() {
+        "glb" => Some("GLB"),
+        "gltf" => Some("GLTF"),
+        "obj" => Some("OBJ"),
+        "stl" => Some("STL"),
+        "3mf" => Some("3MF"),
+        "blend" => Some("BLEND"),
+        _ => None,
+    }
+}
+
+/// Header-only size; models are reported at their render size without being read.
 pub fn dimensions(path: &Path) -> Result<(u32, u32), DecodeError> {
-    Ok(image::image_dimensions(path)?)
+    match kind(path) {
+        Some(MediaKind::Model) => Ok((MODEL_RENDER_SIZE, MODEL_RENDER_SIZE)),
+        Some(MediaKind::Blend) => Ok(blend_thumbnail(path)?.dimensions()),
+        _ => Ok(image::image_dimensions(path)?),
+    }
 }
 
-pub fn decode(path: &Path) -> Result<RgbaImage, DecodeError> {
-    if !is_supported(path) {
-        return Err(DecodeError::Unsupported);
+pub fn decode(path: &Path) -> Result<Decoded, DecodeError> {
+    let still = |image| Decoded { image, triangles: None };
+    match kind(path) {
+        None => Err(DecodeError::Unsupported),
+        Some(MediaKind::Model) => {
+            let scene = model::load(path)?;
+            let gpu = Offscreen::shared().map_err(DecodeError::Gpu)?;
+            let image = gpu.render(&scene, MODEL_RENDER_SIZE).map_err(DecodeError::Gpu)?;
+            Ok(Decoded { image, triangles: Some(scene.triangle_count()) })
+        }
+        Some(MediaKind::Blend) => Ok(still(blend_thumbnail(path)?)),
+        Some(MediaKind::Image) => match extension(path).as_deref() {
+            Some("exr" | "hdr") => Ok(still(tonemap(&image::open(path)?.to_rgba32f()))),
+            _ => Ok(still(image::open(path)?.to_rgba8())),
+        },
     }
-    match extension(path).as_deref() {
-        Some("exr" | "hdr") => Ok(tonemap(&image::open(path)?.to_rgba32f())),
-        _ => Ok(image::open(path)?.to_rgba8()),
-    }
+}
+
+fn blend_thumbnail(path: &Path) -> Result<RgbaImage, DecodeError> {
+    blend::embedded_thumbnail(path)?.ok_or(DecodeError::NoPreview)
 }
 
 fn tonemap(src: &Rgba32FImage) -> RgbaImage {
@@ -73,11 +142,11 @@ mod tests {
     fn supported_extensions() {
         for ok in [
             "a.png", "a.JPG", "a.jpeg", "a.webp", "a.bmp", "a.gif", "a.tif", "a.tiff", "a.exr",
-            "a.hdr",
+            "a.hdr", "a.glb", "a.GLTF", "a.obj", "a.stl", "a.3mf", "a.blend",
         ] {
             assert!(is_supported(Path::new(ok)), "{ok}");
         }
-        for no in ["a.txt", "a.psd", "noext"] {
+        for no in ["a.txt", "a.psd", "noext", "a.blend1"] {
             assert!(!is_supported(Path::new(no)), "{no}");
         }
     }
@@ -88,7 +157,7 @@ mod tests {
         let path = dir.path().join("a.png");
         let src = RgbaImage::from_fn(3, 2, |x, y| Rgba([x as u8 * 40, y as u8 * 90, 7, 200]));
         src.save(&path).unwrap();
-        assert_eq!(decode(&path).unwrap(), src);
+        assert_eq!(decode(&path).unwrap().image, src);
     }
 
     #[test]
@@ -124,9 +193,42 @@ mod tests {
         let path = dir.path().join("a.exr");
         let src = Rgba32FImage::from_pixel(1, 1, Rgba([0.18, 0.18, 0.18, 1.0]));
         src.save(&path).unwrap();
-        let px = decode(&path).unwrap().get_pixel(0, 0).0;
+        let px = decode(&path).unwrap().image.get_pixel(0, 0).0;
         assert!((px[0] as i32 - 141).abs() <= 1, "{px:?}");
         assert_eq!(px[3], 255);
+    }
+
+    #[test]
+    fn badges() {
+        assert_eq!(badge(Path::new("a.Glb")), Some("GLB"));
+        assert_eq!(badge(Path::new("a.blend")), Some("BLEND"));
+        assert_eq!(badge(Path::new("a.3mf")), Some("3MF"));
+        assert_eq!(badge(Path::new("a.png")), None);
+    }
+
+    #[test]
+    fn decode_model_reports_triangles() {
+        let d = decode(&crate::model::fixture("cube.glb")).unwrap();
+        assert_eq!(d.triangles, Some(12));
+        assert_eq!(d.image.dimensions(), (MODEL_RENDER_SIZE, MODEL_RENDER_SIZE));
+    }
+
+    #[test]
+    fn model_dimensions_skip_reading() {
+        assert_eq!(
+            dimensions(Path::new("missing.glb")).unwrap(),
+            (MODEL_RENDER_SIZE, MODEL_RENDER_SIZE)
+        );
+    }
+
+    #[test]
+    fn blend_without_thumbnail_is_no_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.blend");
+        let blocks = vec![(*b"REND", vec![0; 16]), (*b"GLOB", vec![0; 8])];
+        std::fs::write(&path, blend::synth(b"BLENDER17-01v0501", &blocks, None)).unwrap();
+        assert!(matches!(decode(&path), Err(DecodeError::NoPreview)));
+        assert!(matches!(dimensions(&path), Err(DecodeError::NoPreview)));
     }
 
     #[test]

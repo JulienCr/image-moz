@@ -7,7 +7,8 @@ use eframe::egui::{ColorImage, Context, Pos2, Rect, TextureHandle, TextureOption
 use image::RgbaImage;
 use image::imageops::FilterType;
 
-use crate::formats;
+use crate::formats::{self, MediaKind};
+use crate::model::{self, Scene, view::ModelView};
 
 const MIN_SCALE: f32 = 0.02;
 const MAX_SCALE: f32 = 64.0;
@@ -49,9 +50,22 @@ impl ViewTransform {
     }
 }
 
-struct Loaded {
-    full: Arc<RgbaImage>,
-    texture: ColorImage,
+/// What the worker decoded: a bitmap, or a model whose rendering is left to the UI thread.
+enum Payload {
+    Image(RgbaImage),
+    Model(Arc<Scene>),
+}
+
+enum Loaded {
+    Image { full: Arc<RgbaImage>, texture: ColorImage },
+    Model(Arc<Scene>),
+}
+
+fn load_payload(path: &Path) -> Result<Payload, String> {
+    match formats::kind(path) {
+        Some(MediaKind::Model) => model::load(path).map(|scene| Payload::Model(Arc::new(scene))).map_err(|e| e.to_string()),
+        _ => formats::decode(path).map(|d| Payload::Image(d.image)).map_err(|e| e.to_string()),
+    }
 }
 
 type Message = (u64, PathBuf, Result<Loaded, String>);
@@ -63,6 +77,8 @@ pub struct PreviewState {
     /// Path being previewed; also the decode that is awaited until `image` is set.
     pub path: PathBuf,
     pub image: Option<TextureHandle>,
+    /// Set instead of `image` when the file is a 3D model.
+    pub model: Option<ModelView>,
     pub transform: Option<ViewTransform>,
     /// Refit to the viewport every frame until the user zooms or pans.
     pub fitted: bool,
@@ -80,7 +96,7 @@ impl PreviewState {
         let (tx, rx) = crossbeam_channel::unbounded();
         let wake_ctx = ctx.clone();
         let worker = Worker::spawn(
-            |path| formats::decode(path).map_err(|e| e.to_string()),
+            load_payload,
             tx,
             Box::new(move || wake_ctx.request_repaint()),
         );
@@ -88,6 +104,7 @@ impl PreviewState {
             index,
             path: PathBuf::new(),
             image: None,
+            model: None,
             transform: None,
             fitted: true,
             error: None,
@@ -106,6 +123,7 @@ impl PreviewState {
         self.index = index;
         self.path = path.clone();
         self.image = None;
+        self.model = None;
         self.decoded = None;
         self.error = None;
         self.transform = None;
@@ -123,15 +141,19 @@ impl PreviewState {
                 continue;
             }
             match result {
-                Ok(loaded) => {
-                    let size = Vec2::new(loaded.full.width() as f32, loaded.full.height() as f32);
+                Ok(Loaded::Image { full, texture }) => {
+                    let size = Vec2::new(full.width() as f32, full.height() as f32);
                     if self.display_size != Some(size) {
                         self.fitted = true;
                     }
                     self.display_size = Some(size);
-                    self.image = Some(ctx.load_texture("preview", loaded.texture, TextureOptions::LINEAR));
-                    self.decoded = Some(loaded.full);
+                    self.image = Some(ctx.load_texture("preview", texture, TextureOptions::LINEAR));
+                    self.decoded = Some(full);
                 }
+                Ok(Loaded::Model(scene)) => match ModelView::new(scene, &self.path) {
+                    Some(view) => self.model = Some(view),
+                    None => self.error = Some(model::ModelError::Empty.to_string()),
+                },
                 Err(e) => self.error = Some(e),
             }
         }
@@ -167,7 +189,7 @@ struct Worker {
 
 impl Worker {
     fn spawn(
-        decode: impl Fn(&Path) -> Result<RgbaImage, String> + Send + 'static,
+        decode: impl Fn(&Path) -> Result<Payload, String> + Send + 'static,
         tx: Sender<Message>,
         notify: Box<dyn Fn() + Send>,
     ) -> Self {
@@ -202,7 +224,7 @@ impl Worker {
                 if is_stale() {
                     continue;
                 }
-                let result = decoded.map(|img| prepare(img, request.max_side));
+                let result = decoded.map(|payload| prepare(payload, request.max_side));
                 let _ = tx.send((request.generation, request.path, result));
                 notify();
             }
@@ -225,8 +247,12 @@ impl Drop for Worker {
     }
 }
 
-/// Texture-sized copy of `full` (downscaled when a side exceeds `max_side`).
-fn prepare(full: RgbaImage, max_side: usize) -> Loaded {
+/// Texture-sized copy of an image (downscaled when a side exceeds `max_side`); models pass through.
+fn prepare(payload: Payload, max_side: usize) -> Loaded {
+    let full = match payload {
+        Payload::Image(full) => full,
+        Payload::Model(scene) => return Loaded::Model(scene),
+    };
     let (w, h) = (full.width() as usize, full.height() as usize);
     let texture = if w.max(h) > max_side {
         let k = max_side as f32 / w.max(h) as f32;
@@ -236,7 +262,7 @@ fn prepare(full: RgbaImage, max_side: usize) -> Loaded {
     } else {
         ColorImage::from_rgba_unmultiplied([w, h], full.as_raw())
     };
-    Loaded { full: Arc::new(full), texture }
+    Loaded::Image { full: Arc::new(full), texture }
 }
 
 #[cfg(test)]
@@ -291,7 +317,7 @@ mod tests {
             move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(150));
-                Ok(RgbaImage::new(1, 1))
+                Ok(Payload::Image(RgbaImage::new(1, 1)))
             },
             tx,
             Box::new(|| {}),

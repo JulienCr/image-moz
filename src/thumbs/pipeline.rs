@@ -151,6 +151,7 @@ fn worker(
             Work::Probe(job) => {
                 let outcome = guarded(&job, || match formats::dimensions(&job.path) {
                     Ok(dims) => ThumbOutcome::Dims(dims),
+                    Err(formats::DecodeError::NoPreview) => ThumbOutcome::NoPreview,
                     Err(_) => ThumbOutcome::Failed,
                 });
                 (job, true, outcome)
@@ -191,22 +192,23 @@ fn make_thumb(cache: &DiskCache, job: &ThumbJob) -> ThumbOutcome {
         return ThumbOutcome::Ready(thumb);
     }
     let decoded = match formats::decode(&job.path) {
-        Ok(img) => img,
+        Ok(decoded) => decoded,
+        Err(formats::DecodeError::NoPreview) => return ThumbOutcome::NoPreview,
         Err(e) => {
             log::warn!("thumbnail decode failed for {}: {e}", job.path.display());
             return ThumbOutcome::Failed;
         }
     };
-    let orig_dims = decoded.dimensions();
+    let orig_dims = decoded.image.dimensions();
     // `thumbnail` upscales small images, so only call it when shrinking.
     let image = if orig_dims.0.max(orig_dims.1) > THUMB_SIZE {
-        image::DynamicImage::ImageRgba8(decoded)
+        image::DynamicImage::ImageRgba8(decoded.image)
             .thumbnail(THUMB_SIZE, THUMB_SIZE)
             .to_rgba8()
     } else {
-        decoded
+        decoded.image
     };
-    let thumb = Thumb { image, orig_dims };
+    let thumb = Thumb { image, orig_dims, triangles: decoded.triangles };
     if let Err(e) = cache.put(job.key, &thumb) {
         log::warn!("thumbnail cache write failed: {e}");
     }
@@ -376,6 +378,19 @@ mod tests {
         };
         let out = guarded(&job, || panic!("boom"));
         assert!(matches!(out, ThumbOutcome::Failed));
+    }
+
+    #[test]
+    fn pipeline_reports_no_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.blend");
+        let blocks = vec![(*b"REND", vec![0; 16]), (*b"GLOB", vec![0; 8])];
+        std::fs::write(&src, crate::blend::synth(b"BLENDER17-01v0501", &blocks, None)).unwrap();
+        let p = pipeline(&dir.path().join("cache"));
+        p.set_wanted(vec![job(&src)]);
+        assert!(matches!(wait_one(&p).outcome, ThumbOutcome::NoPreview));
+        p.set_probe(vec![job(&src)]);
+        assert!(matches!(wait_one(&p).outcome, ThumbOutcome::NoPreview));
     }
 
     #[test]

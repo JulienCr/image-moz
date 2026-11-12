@@ -37,6 +37,7 @@ Décisions issues d'un grilling en trois rounds (2026-10-29).
 ## 3. Formats
 
 PNG, JPEG, WebP, BMP, GIF (première frame seulement), TIFF, EXR, HDR.
+Modèles 3D : GLB, glTF, OBJ, STL, 3MF, `.blend` (§15).
 
 - EXR / HDR : tone-mapping **ACES** fixe, exposition 0, sortie sRGB. Aucun
   réglage dans l'interface.
@@ -243,6 +244,66 @@ Décisions issues d'un grilling (2026-11-07).
   - clic droit sur une image d'un format supporté
     (`SystemFileAssociations\<ext>\shell`, une clé par extension) : sans
     toucher à l'application par défaut des images.
+
+## 15. Modèles 3D
+
+Décisions issues d'un grilling en deux rounds (2026-11-11).
+
+### Formats et sources d'image
+
+| Format | Source de l'image | Orbite |
+|---|---|---|
+| GLB, glTF | rendu GPU | oui |
+| OBJ (+ `.mtl`) | rendu GPU | oui |
+| STL, 3MF | rendu GPU | oui |
+| `.blend` | vignette embarquée dans le fichier, lue en Rust | non |
+
+- `.blend` : pas de dépendance à Blender. Sans vignette embarquée, la tuile
+  affiche « pas d'aperçu ». L'aperçu plein cadre agrandit la vignette.
+- Version de Blender de référence : 5.3 (Steam).
+
+### Rendu
+
+- **GPU via wgpu.** Les vignettes ont leur **propre device**, indépendant de
+  la fenêtre ; l'orbite dessine avec le device d'eframe.
+- Sans adaptateur matériel (bureau à distance, VM), repli sur l'adaptateur
+  logiciel (WARP).
+- Apparence : couleur de base + texture principale des matériaux. Ni normal
+  maps, ni métal-rugosité, ni transparence.
+- Vignette à fond transparent ; un modèle animé ou riggé est rendu dans sa
+  pose de repos.
+- Caméra : la première caméra de la scène du fichier si elle existe, sinon
+  vue 3/4 auto-cadrée sur la boîte englobante.
+- Axe vertical sans caméra : glTF et OBJ en Y-up, STL et 3MF en Z-up.
+
+### Grille et barre d'état
+
+- Badge de format (`GLB`, `OBJ`, `STL`, `3MF`, `BLEND`…) sur la tuile.
+- La barre d'état affiche le nombre de triangles à la place des dimensions
+  (rien pour un `.blend`).
+
+### Aperçu plein cadre d'un modèle
+
+| Entrée | Action |
+|---|---|
+| glisser bouton du milieu | orbite |
+| `Maj` + glisser bouton du milieu | déplacement |
+| molette | rapprocher / éloigner |
+| `0` | retour à la caméra de départ |
+| `U` | bascule l'axe vertical Y / Z, pour la session |
+
+Flèches, `Échap`, `Espace`, `Ctrl+C` (bitmap de la vue courante) et
+`Ctrl+Alt+C` gardent leur rôle du §9.
+
+### Cache
+
+La clé reste celle du §10 (fichier principal seul). Une annexe modifiée seule
+(`.bin`, `.mtl`, texture) laisse la vignette périmée jusqu'à `F5` ou la
+réécriture du modèle : limite assumée.
+
+### Livraison
+
+Une seule branche pour l'ensemble.
 
 ## Annexe — briques envisagées (à valider à l'implémentation)
 

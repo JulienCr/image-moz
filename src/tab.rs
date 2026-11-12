@@ -254,6 +254,8 @@ impl Tab {
                     match self.library.get(&entry.path) {
                         Some(old) if old.mtime == entry.mtime && old.size == entry.size => {
                             entry.dims = old.dims;
+                            entry.triangles = old.triangles;
+                            entry.no_preview = old.no_preview;
                             entry.error = old.error;
                             entry.arrived_at = old.arrived_at;
                         }

@@ -1,10 +1,12 @@
 pub mod app;
+pub mod blend;
 pub mod config;
 pub mod formats;
 pub mod geometry;
 pub mod instance;
 pub mod layout;
 pub mod library;
+pub mod model;
 pub mod platform;
 pub mod preview;
 pub mod selection;

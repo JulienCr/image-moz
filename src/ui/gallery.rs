@@ -10,6 +10,7 @@ use eframe::egui::{
 };
 
 use super::status;
+use crate::formats;
 use crate::config::{self, Config};
 use crate::layout::{self, BentoRule, Layout, LayoutItem, LayoutKind, LayoutSection};
 use crate::library::{Entry, FsChange, Library, Section, SortOrder};
@@ -142,6 +143,7 @@ static NEXT_GALLERY_ID: AtomicU64 = AtomicU64::new(1);
 /// so several windows can show a tab at once without one starving the other.
 pub struct Thumbs {
     pipeline: ThumbPipeline,
+    cache: DiskCache,
     textures: TextureCache,
     backlog: VecDeque<ThumbResult>,
     wanted: Requests,
@@ -223,6 +225,18 @@ fn fit(rect: Rect, size: Vec2) -> Rect {
     Rect::from_center_size(rect.center(), size * scale)
 }
 
+/// Format label at the bottom-left corner of a tile.
+fn draw_badge(painter: &egui::Painter, tile: Rect, label: &str) {
+    const PAD: f32 = 3.0;
+    let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(10.0), Color32::WHITE);
+    let rect = Rect::from_min_size(
+        pos2(tile.left() + 4.0, tile.bottom() - 4.0 - galley.size().y - 2.0 * PAD),
+        galley.size() + vec2(2.0 * PAD, 2.0 * PAD),
+    );
+    painter.rect_filled(rect, CornerRadius::same(3), Color32::from_black_alpha(160));
+    painter.galley(rect.min + vec2(PAD, PAD), galley, Color32::WHITE);
+}
+
 /// Scroll offset that puts the anchor tile back at its previous on-screen y.
 fn anchored_offset(new_tile_y: f32, screen_y: f32, content_h: f32, viewport_h: f32) -> f32 {
     (new_tile_y - screen_y).clamp(0.0, (content_h - viewport_h).max(0.0))
@@ -239,13 +253,20 @@ impl Thumbs {
             Arc::new(move || ctx.request_repaint())
         };
         Self {
-            pipeline: ThumbPipeline::new(cache, wake),
+            pipeline: ThumbPipeline::new(cache.clone(), wake),
+            cache,
             textures: TextureCache::default(),
             backlog: VecDeque::new(),
             wanted: Requests::default(),
             probes: Requests::default(),
             near_tiles: HashMap::new(),
         }
+    }
+
+    /// Drops the texture and the disk entry of `key` so its next request renders from the source.
+    fn invalidate(&mut self, key: ThumbKey) {
+        self.textures.remove(key);
+        self.cache.remove(key);
     }
 
     /// Drops every queued request, e.g. when no tab is left to want them.
@@ -305,11 +326,17 @@ impl Thumbs {
                 let dims = match &result.outcome {
                     ThumbOutcome::Ready(thumb) => {
                         entry.error = false;
+                        entry.no_preview = false;
+                        entry.triangles = thumb.triangles;
                         Some(thumb.orig_dims)
                     }
                     ThumbOutcome::Dims(dims) => Some(*dims),
                     ThumbOutcome::Failed => {
                         entry.error = true;
+                        None
+                    }
+                    ThumbOutcome::NoPreview => {
+                        entry.no_preview = true;
                         None
                     }
                 };
@@ -476,9 +503,13 @@ impl Gallery {
         self.library_changed();
     }
 
-    /// User refresh: failed tiles get another attempt.
+    /// User refresh: failed tiles get another attempt, and model thumbnails are rendered anew
+    /// because their annex files (.mtl, .bin, textures) change without touching the model's key.
     pub fn retry_failed(&mut self, thumbs: &mut Thumbs, library: &mut Library) {
         library.clear_errors();
+        for entry in library.iter().filter(|e| formats::kind(&e.path) == Some(formats::MediaKind::Model)) {
+            thumbs.invalidate(key_for(&entry.path, entry.mtime, entry.size));
+        }
         thumbs.pipeline.forget_all();
         self.last_wanted = None;
         self.library_changed();
@@ -571,6 +602,7 @@ impl Gallery {
             if let Some(e) = library.get(path)
                 && e.dims.is_none()
                 && !e.error
+                && !e.no_preview
             {
                 jobs.push(ThumbJob { path: path.clone(), key: key_for(path, e.mtime, e.size) });
             }
@@ -724,7 +756,7 @@ impl Gallery {
             let entry = view.library.get(path);
             let in_view = rel.intersects(viewport);
             let loaded = view.thumbs.textures.contains(key);
-            if !loaded && !entry.is_some_and(|e| e.error) {
+            if !loaded && !entry.is_some_and(|e| e.error || e.no_preview) {
                 let job = ThumbJob { path: path.clone(), key };
                 if in_view {
                     near_jobs.push(job);
@@ -756,6 +788,17 @@ impl Gallery {
                     FontId::proportional(28.0),
                     Color32::from_rgb(230, 160, 40),
                 );
+            } else if entry.is_some_and(|e| e.no_preview) {
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "pas d'aperçu",
+                    FontId::proportional(13.0),
+                    ui.visuals().weak_text_color(),
+                );
+            }
+            if let Some(label) = formats::badge(path) {
+                draw_badge(painter, rect, label);
             }
             let accent = Color32::from_rgb(70, 140, 255);
             if view.selection.contains(id) {
@@ -1130,6 +1173,39 @@ mod tests {
         assert!(!library.get(&bad).unwrap().error);
         probe(&mut thumbs, &mut gallery, &library);
         assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &bad, |e| e.error));
+    }
+
+    #[test]
+    fn refresh_renders_model_thumbnails_again_but_keeps_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let (model, img) = (dir.path().join("m.obj"), dir.path().join("a.png"));
+        std::fs::write(&model, b"not a model").unwrap();
+        write_image(&img);
+        let ctx = Context::default();
+        let cache = DiskCache::open(dir.path().join("cache")).unwrap();
+        let mut thumbs = Thumbs::with_cache(&ctx, cache.clone());
+        let mut gallery = Gallery::new();
+        let mut library = library_of(dir.path());
+        let jobs = [&model, &img].map(|p| {
+            let e = library.get(p).unwrap();
+            ThumbJob { path: e.path.clone(), key: key_for(&e.path, e.mtime, e.size) }
+        });
+        let keys = jobs.clone().map(|j| j.key);
+        let stale = crate::thumbs::Thumb { image: image::RgbaImage::new(2, 2), orig_dims: (40, 20), triangles: Some(1) };
+        for key in keys {
+            cache.put(key, &stale).unwrap();
+        }
+        thumbs.set_wanted(gallery.id, jobs.to_vec());
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &model, has_dims));
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &img, has_dims));
+        assert!(thumbs.textures.contains(keys[0]) && thumbs.textures.contains(keys[1]));
+
+        gallery.retry_failed(&mut thumbs, &mut library);
+        assert!(!thumbs.textures.contains(keys[0]) && cache.get(keys[0]).is_none());
+        assert!(thumbs.textures.contains(keys[1]) && cache.get(keys[1]).is_some());
+
+        thumbs.set_wanted(gallery.id, jobs.to_vec());
+        assert!(settles(&ctx, &mut thumbs, &mut gallery, &mut library, &model, |e| e.error));
     }
 
     #[test]
