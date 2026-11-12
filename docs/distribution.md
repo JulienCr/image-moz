@@ -43,7 +43,8 @@ erreur. Le résultat est `installer/Output/image-moz-setup-<version>.exe`
   - `Directory\Background\shell\ImageMoz` : clic droit sur le fond d'un
     dossier ouvert (argument `%V`) ;
   - `SystemFileAssociations\.<ext>\shell\ImageMoz` pour `png`, `jpg`, `jpeg`,
-    `webp`, `bmp`, `gif`, `tif`, `tiff`, `exr` et `hdr` (argument `%1`).
+    `webp`, `bmp`, `gif`, `tif`, `tiff`, `exr`, `hdr`, `glb`, `gltf`, `obj`,
+    `stl`, `3mf` et `blend` (argument `%1`).
 
 Sous Windows 11, ces entrées apparaissent sous « Afficher plus d'options ».
 L'application par défaut des images n'est pas modifiée. Si les formats

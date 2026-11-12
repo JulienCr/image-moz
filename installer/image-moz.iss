@@ -71,3 +71,21 @@ Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.exr\shell\ImageMoz
 Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.hdr\shell\ImageMoz"; ValueType: string; ValueData: "{#MenuLabel}"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.hdr\shell\ImageMoz"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#ExeName}"",0"
 Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.hdr\shell\ImageMoz\command"; ValueType: string; ValueData: """{app}\{#ExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.glb\shell\ImageMoz"; ValueType: string; ValueData: "{#MenuLabel}"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.glb\shell\ImageMoz"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#ExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.glb\shell\ImageMoz\command"; ValueType: string; ValueData: """{app}\{#ExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.gltf\shell\ImageMoz"; ValueType: string; ValueData: "{#MenuLabel}"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.gltf\shell\ImageMoz"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#ExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.gltf\shell\ImageMoz\command"; ValueType: string; ValueData: """{app}\{#ExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.obj\shell\ImageMoz"; ValueType: string; ValueData: "{#MenuLabel}"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.obj\shell\ImageMoz"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#ExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.obj\shell\ImageMoz\command"; ValueType: string; ValueData: """{app}\{#ExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.stl\shell\ImageMoz"; ValueType: string; ValueData: "{#MenuLabel}"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.stl\shell\ImageMoz"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#ExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.stl\shell\ImageMoz\command"; ValueType: string; ValueData: """{app}\{#ExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.3mf\shell\ImageMoz"; ValueType: string; ValueData: "{#MenuLabel}"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.3mf\shell\ImageMoz"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#ExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.3mf\shell\ImageMoz\command"; ValueType: string; ValueData: """{app}\{#ExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.blend\shell\ImageMoz"; ValueType: string; ValueData: "{#MenuLabel}"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.blend\shell\ImageMoz"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#ExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\SystemFileAssociations\.blend\shell\ImageMoz\command"; ValueType: string; ValueData: """{app}\{#ExeName}"" ""%1"""
