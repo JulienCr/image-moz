@@ -24,15 +24,20 @@ pub fn format_size(bytes: u64) -> String {
 /// `12 345 triangles` with a narrow no-break space between thousands.
 pub fn triangles_text(count: Option<u32>) -> String {
     let Some(n) = count else { return "? triangles".to_string() };
+    format!("{} triangle{}", group_thousands(n), if n == 1 { "" } else { "s" })
+}
+
+/// `48 212` with a narrow no-break space (U+202F) between thousands.
+pub fn group_thousands(n: u32) -> String {
     let digits = n.to_string();
-    let mut grouped = String::new();
+    let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            grouped.push('\u{202F}');
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('\u{202F}');
         }
-        grouped.push(c);
+        out.push(c);
     }
-    format!("{grouped} triangle{}", if n == 1 { "" } else { "s" })
+    out
 }
 
 /// Empty for `.blend` files, whose size says nothing about the scene.

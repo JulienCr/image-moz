@@ -44,7 +44,8 @@ pub enum Nav {
 pub fn show(ui: &mut Ui, state: &mut PreviewState, thumb: Option<&TextureHandle>, gpu: Gpu, info: &Info) -> Option<Nav> {
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
-    let layout = chrome::Layout::new(ui, rect, state.model.is_some());
+    let help_t = chrome::help_alpha(ui, state);
+    let layout = chrome::Layout::new(ui, rect, state.model.is_some(), help_t);
     let blocked = layout.pointer_over(ui);
     // Registered after the image response, these sit on top and swallow presses meant for pan or zoom.
     layout.block_input(ui, response.id);

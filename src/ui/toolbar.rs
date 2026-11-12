@@ -31,6 +31,9 @@ struct Responsive {
     sort_label: bool,
     slider_width: f32,
     bento_label: bool,
+    slider_visible: bool,
+    open_label: bool,
+    separators: bool,
 }
 
 const SORT_WIDTH: f32 = 100.0;
@@ -49,16 +52,23 @@ fn responsive(width: f32) -> Responsive {
         sort_label: true,
         slider_width: 120.0,
         bento_label: true,
+        slider_visible: true,
+        open_label: true,
+        separators: true,
     }
 }
 
 /// Degrades `r` step by step until `required(r)` fits in `available`.
 fn fit(mut r: Responsive, available: f32, required: impl Fn(&Responsive) -> f32) -> Responsive {
-    let steps: [fn(&mut Responsive); 4] = [
+    let steps: [fn(&mut Responsive); 8] = [
         |r| r.sort_label = false,
         |r| r.slider_width = 80.0,
         |r| r.filter_width = r.filter_width.min(140.0),
         |r| r.bento_label = false,
+        |r| r.slider_visible = false,
+        |r| r.open_label = false,
+        |r| r.filter_width = 100.0,
+        |r| r.separators = false,
     ];
     for step in steps {
         if required(&r) <= available {
@@ -81,6 +91,9 @@ fn chip_width(ui: &Ui, icon: &str, icon_size: f32, label: Option<&str>) -> f32 {
 }
 
 fn right_group_width(r: &Responsive) -> f32 {
+    if !r.slider_visible {
+        return r.filter_width;
+    }
     let icons = if r.slider_icons { 16.0 + 8.0 + 8.0 + 12.0 } else { 0.0 };
     r.filter_width + 8.0 + 4.0 + r.slider_width + icons
 }
@@ -98,11 +111,15 @@ fn bento_width(r: &Responsive) -> f32 {
 /// Width the left groups need with `r` applied, spacing included (measured within 15 px, over).
 fn left_group_width(ui: &Ui, r: &Responsive, bento: bool) -> f32 {
     let label = |text| r.chip_labels.then_some(text);
-    let open = 20.0 + text_width(ui, icons::FOLDER_OPEN, theme::icon_font(16.0)) + 6.0 + text_width(ui, "Ouvrir", medium());
-    let separator = 12.0 + 1.0 + 12.0;
+    let open = if r.open_label {
+        20.0 + text_width(ui, icons::FOLDER_OPEN, theme::icon_font(16.0)) + 6.0 + text_width(ui, "Ouvrir", medium())
+    } else {
+        CONTROL
+    };
+    let separator = if r.separators { 12.0 + 1.0 + 12.0 } else { 8.0 };
     let segmented = 4.0 + 3.0 * 32.0 + 2.0 * 2.0;
     let sort = if r.sort_label { SORT_WIDTH } else { SORT_COMPACT_WIDTH };
-    let gaps = if bento { 12.0 } else { 11.0 };
+    let gaps = (if bento { 12.0 } else { 11.0 }) - if r.separators { 0.0 } else { 4.0 };
     open + separator
         + chip_width(ui, icons::TREE_STRUCTURE, 14.0, label("Récursif"))
         + chip_width(ui, icons::LIST, 14.0, label("À plat"))
@@ -142,7 +159,11 @@ fn medium() -> FontId {
     FontId::new(13.0, FontFamily::Name(theme::MEDIUM.into()))
 }
 
-fn separator(ui: &mut Ui, p: &Palette) {
+fn separator(ui: &mut Ui, p: &Palette, visible: bool) {
+    if !visible {
+        ui.add_space(8.0);
+        return;
+    }
     ui.add_space(12.0);
     let (rect, _) = ui.allocate_exact_size(vec2(1.0, 20.0), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, p.border);
@@ -341,6 +362,9 @@ pub fn show(
         ui.add_enabled_ui(has_tab, |ui| filter_field(ui, filter, narrow.filter_width));
         ui.add_space(4.0);
         ui.scope(|ui| {
+            if !narrow.slider_visible {
+                return;
+            }
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // Right to left: the large icon is added first, so the order below is reversed.
@@ -359,11 +383,11 @@ pub fn show(
     ui.scope_builder(UiBuilder::new().max_rect(left_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
         ui.set_clip_rect(ui.clip_rect().intersect(left_rect));
         ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
-        let open = Button { icon: icons::FOLDER_OPEN, icon_size: 16.0, label: Some("Ouvrir"), selected: false, filled: true };
+        let open = Button { icon: icons::FOLDER_OPEN, icon_size: 16.0, label: narrow.open_label.then_some("Ouvrir"), selected: false, filled: true };
         if button(ui, open).on_hover_text("Ouvrir un dossier").clicked() {
             events.open = true;
         }
-        separator(ui, p);
+        separator(ui, p, narrow.separators);
 
         ui.add_enabled_ui(has_tab, |ui| {
             let label = |text| narrow.chip_labels.then_some(text);
@@ -386,7 +410,7 @@ pub fn show(
                 }
             });
         });
-        separator(ui, p);
+        separator(ui, p, narrow.separators);
 
         let kinds = [LayoutKind::Grid, LayoutKind::Justified, LayoutKind::Bento];
         let items = [
@@ -503,10 +527,35 @@ mod tests {
     }
 
     #[test]
+    fn late_steps_hide_the_slider_then_shrink_open_filter_and_separators() {
+        let need = |r: &Responsive| {
+            100.0
+                + if r.slider_visible { 20.0 } else { 0.0 }
+                + if r.open_label { 20.0 } else { 0.0 }
+                + if r.filter_width > 100.0 { 20.0 } else { 0.0 }
+                + if r.separators { 20.0 } else { 0.0 }
+        };
+        let base = || {
+            let mut r = responsive(900.0);
+            (r.sort_label, r.slider_width, r.bento_label) = (false, 80.0, false);
+            r.filter_width = 140.0;
+            r
+        };
+        let r = fit(base(), 160.0, need);
+        assert!(!r.slider_visible && r.open_label && r.filter_width == 140.0 && r.separators);
+        let r = fit(base(), 140.0, need);
+        assert!(!r.open_label && r.filter_width == 140.0);
+        let r = fit(base(), 120.0, need);
+        assert!(r.filter_width == 100.0 && r.separators);
+        let r = fit(base(), 100.0, need);
+        assert!(!r.separators && !r.slider_visible && !r.open_label && r.filter_width == 100.0);
+    }
+
+    #[test]
     fn the_filter_never_grows_when_it_shrinks() {
         let r = fit(responsive(1280.0), 0.0, fake_required);
-        assert_eq!(r.filter_width, 140.0);
+        assert_eq!(r.filter_width, 100.0);
         let r = fit(responsive(600.0), 0.0, fake_required);
-        assert_eq!(r.filter_width, 140.0);
+        assert_eq!(r.filter_width, 100.0);
     }
 }

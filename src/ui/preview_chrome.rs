@@ -63,31 +63,20 @@ fn help_visible(now: f64, last_motion: f64) -> bool {
     now - last_motion < HELP_IDLE_SECS
 }
 
-/// `48 212` with a no-break space between thousands.
-fn group_thousands(n: u32) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push('\u{a0}');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// Where the chrome sits; computed before the content so it can shield the image from input.
 pub struct Layout {
     rect: Rect,
     is_model: bool,
     banner: Rect,
+    /// Opacity of the help pill; it only blocks input while above zero.
+    help_t: f32,
     prev: Rect,
     next: Rect,
     pill: Rect,
 }
 
 impl Layout {
-    pub fn new(ui: &Ui, rect: Rect, is_model: bool) -> Self {
+    pub fn new(ui: &Ui, rect: Rect, is_model: bool, help_t: f32) -> Self {
         let banner = Rect::from_min_size(rect.min, vec2(rect.width(), BANNER_H));
         let arrow = |x: f32| Rect::from_center_size(pos2(x, rect.center().y), Vec2::splat(ARROW_SIZE));
         let bottom = if is_model { 14.0 } else { 16.0 };
@@ -115,11 +104,16 @@ impl Layout {
             prev: arrow(rect.min.x + ARROW_MARGIN + ARROW_SIZE / 2.0),
             next: arrow(rect.max.x - ARROW_MARGIN - ARROW_SIZE / 2.0),
             pill,
+            help_t,
         }
     }
 
-    fn rects(&self) -> [Rect; 4] {
-        [self.banner, self.prev, self.next, self.pill]
+    fn rects(&self) -> Vec<Rect> {
+        let mut rects = vec![self.banner, self.prev, self.next];
+        if self.help_t > 0.0 {
+            rects.push(self.pill);
+        }
+        rects
     }
 
     pub fn pointer_over(&self, ui: &Ui) -> bool {
@@ -141,7 +135,7 @@ fn help_items(is_model: bool) -> &'static [(&'static str, &'static str); 5] {
 pub fn show(ui: &mut Ui, state: &mut PreviewState, info: &Info, layout: &Layout) -> Option<Nav> {
     let mut nav = banner(ui, state, info, layout);
     nav = arrows(ui, info, layout).or(nav);
-    help_pill(ui, state, layout);
+    help_pill(ui, layout);
     nav
 }
 
@@ -212,7 +206,7 @@ fn banner(ui: &mut Ui, state: &mut PreviewState, info: &Info, layout: &Layout) -
 
     let details = if layout.is_model {
         let tri = state.model.as_ref().map(|m| m.triangle_count()).or(info.triangles);
-        let tri = tri.map_or_else(|| "? tri".to_owned(), |n| format!("{} tri", group_thousands(n)));
+        let tri = tri.map_or_else(|| "? tri".to_owned(), |n| format!("{} tri", super::status::group_thousands(n)));
         format!("{tri} · {} / {}", info.position.0, info.position.1)
     } else {
         info.meta.clone()
@@ -367,7 +361,8 @@ fn arrows(ui: &mut Ui, info: &Info, layout: &Layout) -> Option<Nav> {
     nav
 }
 
-fn help_pill(ui: &mut Ui, state: &mut PreviewState, layout: &Layout) {
+/// Advances the help pill's fade and returns its opacity; call once per frame before building the `Layout`.
+pub fn help_alpha(ui: &Ui, state: &mut PreviewState) -> f32 {
     let ctx = ui.ctx().clone();
     let (now, moved) = ctx.input(|i| (i.time, i.pointer.delta() != Vec2::ZERO));
     if moved {
@@ -378,7 +373,12 @@ fn help_pill(ui: &mut Ui, state: &mut PreviewState, layout: &Layout) {
         let left = HELP_IDLE_SECS - (now - state.pointer_moved_at);
         ctx.request_repaint_after_secs(left.max(0.0) as f32 + 0.02);
     }
-    let t = ctx.animate_bool_with_time(Id::new("preview-help"), visible, HELP_FADE_SECS);
+    // The animation manager is per Context: scope by viewport so two preview windows don't share it.
+    ctx.animate_bool_with_time(Id::new(("preview-help", ctx.viewport_id())), visible, HELP_FADE_SECS)
+}
+
+fn help_pill(ui: &mut Ui, layout: &Layout) {
+    let t = layout.help_t;
     if t <= 0.0 {
         return;
     }
@@ -411,8 +411,8 @@ mod tests {
 
     #[test]
     fn thousands_are_grouped_with_no_break_spaces() {
-        assert_eq!(group_thousands(48_212), "48\u{a0}212");
-        assert_eq!(group_thousands(999), "999");
-        assert_eq!(group_thousands(1_000_000), "1\u{a0}000\u{a0}000");
+        assert_eq!(super::super::status::group_thousands(48_212), "48\u{202f}212");
+        assert_eq!(super::super::status::group_thousands(999), "999");
+        assert_eq!(super::super::status::group_thousands(1_000_000), "1\u{202f}000\u{202f}000");
     }
 }
