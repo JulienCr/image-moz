@@ -1,5 +1,6 @@
 pub mod app;
 pub mod blend;
+pub mod cgbi;
 pub mod config;
 pub mod formats;
 pub mod geometry;
