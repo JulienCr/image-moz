@@ -83,6 +83,8 @@ pub struct PreviewState {
     /// Refit to the viewport every frame until the user zooms or pans.
     pub fitted: bool,
     pub error: Option<String>,
+    /// `Context` time of the last pointer movement; drives the help pill.
+    pub pointer_moved_at: f64,
     /// Size the transform is computed against: the original dims once known.
     pub display_size: Option<Vec2>,
     decoded: Option<Arc<RgbaImage>>,
@@ -108,6 +110,7 @@ impl PreviewState {
             transform: None,
             fitted: true,
             error: None,
+            pointer_moved_at: ctx.input(|i| i.time),
             display_size: None,
             decoded: None,
             generation: 0,

@@ -1,28 +1,64 @@
 use std::path::Path;
 
 use eframe::egui::{
-    Align2, Color32, CursorIcon, Event, FontId, MouseWheelUnit, PointerButton, Rect, Sense, TextureHandle, Ui, Vec2,
-    pos2,
+    Align2, Color32, CursorIcon, Event, FontId, MouseWheelUnit, PointerButton, Rect, Response, Sense, TextureHandle, Ui,
+    Vec2, pos2,
 };
 use eframe::egui_wgpu::RenderState;
 
+use super::preview_chrome as chrome;
 use super::theme;
 use crate::formats::{self, MediaKind};
 use crate::model::gpu::ModelRenderer;
 use crate::preview::{PreviewState, ViewTransform};
 
 const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-const NOTCH_FACTOR: f32 = 1.1;
+pub(super) const NOTCH_FACTOR: f32 = 1.1;
 /// Touchpads report points; this many make one wheel notch.
 const POINTS_PER_NOTCH: f32 = 40.0;
 
 /// What a 3D model needs to be drawn on eframe's device.
 pub type Gpu<'a> = Option<(&'a RenderState, &'a ModelRenderer)>;
 
+/// What the chrome prints about the previewed file.
+pub struct Info {
+    pub name: String,
+    /// "2048 × 1365 · 1,9 Mo".
+    pub meta: String,
+    pub rel_dir: String,
+    /// Fallback for a model whose scene is not loaded yet.
+    pub triangles: Option<u32>,
+    /// 1-based position in the gallery order, and the order's length.
+    pub position: (usize, usize),
+}
+
+/// What the chrome asks the tab to do.
+pub enum Nav {
+    Close,
+    Step(isize),
+}
+
 /// Draws the preview in the remaining space; `thumb` stands in until the original is decoded.
-pub fn show(ui: &mut Ui, state: &mut PreviewState, thumb: Option<&TextureHandle>, gpu: Gpu) {
+pub fn show(ui: &mut Ui, state: &mut PreviewState, thumb: Option<&TextureHandle>, gpu: Gpu, info: &Info) -> Option<Nav> {
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
+    let layout = chrome::Layout::new(ui, rect, state.model.is_some());
+    let blocked = layout.pointer_over(ui);
+    // Registered after the image response, these sit on top and swallow presses meant for pan or zoom.
+    layout.block_input(ui, response.id);
+    paint_content(ui, &response, rect, state, thumb, gpu, blocked);
+    chrome::show(ui, state, info, &layout)
+}
+
+fn paint_content(
+    ui: &mut Ui,
+    response: &Response,
+    rect: Rect,
+    state: &mut PreviewState,
+    thumb: Option<&TextureHandle>,
+    gpu: Gpu,
+    blocked: bool,
+) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::palette(ui.ctx()).preview_bg);
 
@@ -33,7 +69,7 @@ pub fn show(ui: &mut Ui, state: &mut PreviewState, thumb: Option<&TextureHandle>
         return;
     }
     if state.model.is_some() {
-        show_model(ui, &response, rect, state, gpu);
+        show_model(ui, response, rect, state, gpu, blocked);
         return;
     }
     let Some(size) = state.display_size.or_else(|| texture.map(TextureHandle::size_vec2)) else {
@@ -47,7 +83,7 @@ pub fn show(ui: &mut Ui, state: &mut PreviewState, thumb: Option<&TextureHandle>
     };
     if let Some(cursor) = response.hover_pos().or(ui.input(|i| i.pointer.hover_pos())) {
         let factor = ui.input(|i| wheel_factor(&i.events));
-        if factor != 1.0 && rect.contains(cursor) {
+        if factor != 1.0 && rect.contains(cursor) && !blocked {
             transform.zoom_at(factor, cursor);
             state.fitted = false;
         }
@@ -74,7 +110,7 @@ fn error_text(path: &Path, message: &str) -> String {
 }
 
 /// Middle drag orbits, Shift + middle drag pans, the wheel dollies; the left button does nothing.
-fn show_model(ui: &mut Ui, response: &eframe::egui::Response, rect: Rect, state: &mut PreviewState, gpu: Gpu) {
+fn show_model(ui: &mut Ui, response: &Response, rect: Rect, state: &mut PreviewState, gpu: Gpu, blocked: bool) {
     let painter = ui.painter_at(rect);
     let Some((rs, renderer)) = gpu else {
         let text = "Rendu 3D indisponible";
@@ -92,8 +128,8 @@ fn show_model(ui: &mut Ui, response: &eframe::egui::Response, rect: Rect, state:
         }
         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
     }
-    let hovered = response.hover_pos().or(ui.input(|i| i.pointer.hover_pos())).is_some_and(|p| rect.contains(p));
-    let notches = if hovered { ui.input(|i| wheel_notches(&i.events)) } else { 0.0 };
+    let over_view = response.hover_pos().or(ui.input(|i| i.pointer.hover_pos())).is_some_and(|p| rect.contains(p));
+    let notches = if over_view && !blocked { ui.input(|i| wheel_notches(&i.events)) } else { 0.0 };
     if notches != 0.0 {
         model.dolly(notches);
     }
