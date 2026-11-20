@@ -32,6 +32,8 @@ pub enum SortOrder {
     DateAsc,
     NameAsc,
     NameDesc,
+    SizeDesc,
+    SizeAsc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,15 +206,20 @@ impl Library {
                 SortOrder::DateAsc => items.sort_by_key(|e| (e.mtime, e.name.to_lowercase())),
                 SortOrder::NameAsc => items.sort_by_key(|e| e.name.to_lowercase()),
                 SortOrder::NameDesc => items.sort_by_key(|e| Reverse(e.name.to_lowercase())),
+                SortOrder::SizeDesc => items.sort_by_key(|e| (Reverse(e.size), e.name.to_lowercase())),
+                SortOrder::SizeAsc => items.sort_by_key(|e| (e.size, e.name.to_lowercase())),
             }
         }
         let newest = |items: &[&Entry]| items.iter().map(|e| e.mtime).max();
+        let total = |items: &[&Entry]| items.iter().map(|e| e.size).sum::<u64>();
         sections.sort_by(|(da, a), (db, b)| {
             (!da.is_empty()).cmp(&!db.is_empty()).then_with(|| match sort {
                 SortOrder::DateDesc => newest(b).cmp(&newest(a)),
                 SortOrder::DateAsc => newest(a).cmp(&newest(b)),
                 SortOrder::NameAsc => da.to_lowercase().cmp(&db.to_lowercase()),
                 SortOrder::NameDesc => db.to_lowercase().cmp(&da.to_lowercase()),
+                SortOrder::SizeDesc => total(b).cmp(&total(a)),
+                SortOrder::SizeAsc => total(a).cmp(&total(b)),
             })
             .then_with(|| da.cmp(db))
         });
@@ -299,6 +306,31 @@ mod tests {
         let lib = lib_of(d.path(), false);
         assert_eq!(names(&lib, SortOrder::NameAsc), ["A.png", "b.png", "c.png"]);
         assert_eq!(names(&lib, SortOrder::NameDesc), ["c.png", "b.png", "A.png"]);
+    }
+
+    #[test]
+    fn sort_size_orders_items_and_breaks_ties_by_name() {
+        let d = tempfile::tempdir().unwrap();
+        for (n, bytes) in [("b.png", 10), ("a.png", 10), ("big.png", 500), ("small.png", 1)] {
+            touch(&d.path().join(n), 10);
+            fs::write(d.path().join(n), vec![0u8; bytes]).unwrap();
+        }
+        let lib = lib_of(d.path(), false);
+        assert_eq!(names(&lib, SortOrder::SizeDesc), ["big.png", "a.png", "b.png", "small.png"]);
+        assert_eq!(names(&lib, SortOrder::SizeAsc), ["small.png", "a.png", "b.png", "big.png"]);
+    }
+
+    #[test]
+    fn sections_by_size_use_folder_total() {
+        let d = tempfile::tempdir().unwrap();
+        for (n, bytes) in [("root.png", 1), ("many/a.png", 30), ("many/b.png", 30), ("one/c.png", 50)] {
+            touch(&d.path().join(n), 10);
+            fs::write(d.path().join(n), vec![0u8; bytes]).unwrap();
+        }
+        let lib = lib_of(d.path(), true);
+        let dirs = |s| lib.sections(s, "", false).into_iter().map(|s| s.rel_dir).collect::<Vec<_>>();
+        assert_eq!(dirs(SortOrder::SizeDesc), ["", "many", "one"]);
+        assert_eq!(dirs(SortOrder::SizeAsc), ["", "one", "many"]);
     }
 
     #[test]

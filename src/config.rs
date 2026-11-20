@@ -251,7 +251,7 @@ mod tests {
         cfg.session.active_window = 1;
         cfg.set_folder_settings(
             Path::new(r"D:\Pics"),
-            FolderSettings { recursive: true, sort: SortOrder::NameDesc, flat: true },
+            FolderSettings { recursive: true, sort: SortOrder::SizeDesc, flat: true },
         );
         cfg.toggle_pin(Path::new(r"D:\Pics"), Path::new(r"D:\Pics\a.png"));
         cfg.save(&path).unwrap();
