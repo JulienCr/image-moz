@@ -201,7 +201,7 @@ impl Tab {
 
     /// Selects `path` once the scan lists it; ignored when the folder is settled and lacks it.
     pub fn select_when_listed(&mut self, path: PathBuf) {
-        self.gallery.set_filter("");
+        self.gallery.clear_filter();
         if self.scan.is_some() || self.library.get(&path).is_some() {
             self.pending_select = Some(path);
         }

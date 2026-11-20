@@ -204,13 +204,14 @@ fn banner(ui: &mut Ui, state: &mut PreviewState, info: &Info, layout: &Layout) -
     ui.painter().galley(pos2(x, cy - name.size().y / 2.0), name, Color32::PLACEHOLDER);
     x += name_width + GAP;
 
-    let details = if layout.is_model {
+    let main = if layout.is_model {
         let tri = state.model.as_ref().map(|m| m.triangle_count()).or(info.triangles);
         let tri = tri.map_or_else(|| "? tri".to_owned(), |n| format!("{} tri", super::status::group_thousands(n)));
         format!("{tri} · {} / {}", info.position.0, info.position.1)
     } else {
         info.meta.clone()
     };
+    let details = format!("{main} · {}", info.dates);
     x = weak_text(ui, x, cy, &details, mono(12.0), weak, max_x);
     if !layout.is_model {
         weak_text(ui, x, cy, &info.rel_dir, FontId::proportional(12.5), weak, max_x);

@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::time::SystemTime;
+
 use eframe::egui::{
     Align, Align2, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Rect, Response,
     RichText, Sense, Shadow, Stroke, StrokeKind, TextEdit, TextFormat, Tooltip, Ui, UiBuilder, epaint::Shape, pos2,
@@ -7,9 +10,10 @@ use eframe::egui::{
 use super::theme::{self, Palette, icons};
 use crate::config::{Config, FolderSettings, MAX_SIZE, MIN_SIZE};
 use crate::layout::{BentoRule, LayoutKind};
-use crate::library::SortOrder;
+use crate::library::{Filter, QuickCounts, SortOrder};
 
 pub const HEIGHT: f32 = 44.0;
+pub const QUICK_HEIGHT: f32 = 30.0;
 const CONTROL: f32 = 28.0;
 
 #[derive(Default)]
@@ -187,8 +191,9 @@ fn button(ui: &mut Ui, b: Button) -> Response {
     let color = if b.selected { p.active_text } else if b.filled { p.text } else { p.text_muted };
     let icon = ui.painter().layout_no_wrap(b.icon.to_owned(), theme::icon_font(b.icon_size), color);
     let label = b.label.map(|l| ui.painter().layout_no_wrap(l.to_owned(), medium(), color));
+    let gap = if b.icon.is_empty() { 0.0 } else { 6.0 };
     let pad = if label.is_some() { 10.0 } else { (CONTROL - icon.size().x) / 2.0 };
-    let width = pad * 2.0 + icon.size().x + label.as_ref().map_or(0.0, |l| 6.0 + l.size().x);
+    let width = pad * 2.0 + icon.size().x + label.as_ref().map_or(0.0, |l| gap + l.size().x);
     let (rect, response) = ui.allocate_exact_size(vec2(width, CONTROL), Sense::click());
     let fill = if b.selected {
         p.active_bg
@@ -207,7 +212,7 @@ fn button(ui: &mut Ui, b: Button) -> Response {
     let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.4) };
     let mut x = rect.left() + pad;
     ui.painter().galley(pos2(x, rect.center().y - icon.size().y / 2.0), icon.clone(), fade(color));
-    x += icon.size().x + 6.0;
+    x += icon.size().x + gap;
     if let Some(label) = label {
         ui.painter().galley(pos2(x, rect.center().y - label.size().y / 2.0), label, fade(color));
     }
@@ -375,6 +380,57 @@ fn size_slider(ui: &mut Ui, config: &mut Config, p: &Palette, width: f32) -> boo
         response.clone().on_hover_text(text);
     }
     response.changed()
+}
+
+/// Type chips to show: the library's types, plus selected ones that vanished; none when too few kinds.
+fn type_chips(counts: &QuickCounts, selected: &BTreeSet<String>) -> Vec<(String, usize)> {
+    if counts.types.len() < 2 && selected.is_empty() {
+        return Vec::new();
+    }
+    let mut chips = counts.types.clone();
+    chips.extend(selected.iter().filter(|s| !counts.types.iter().any(|(t, _)| t == *s)).map(|s| (s.clone(), 0)));
+    chips
+}
+
+/// Chip row under the toolbar: today and file types, plus a clear button while one is active.
+pub fn quick_row(ui: &mut Ui, filter: &mut Filter, counts: &QuickCounts, since: SystemTime) {
+    let p = theme::palette(ui.ctx());
+    let full = ui.available_rect_before_wrap();
+    let mut clear = false;
+    let clear_width = if filter.has_quick() { CONTROL + 8.0 } else { 0.0 };
+    if clear_width > 0.0 {
+        let rect = Rect::from_min_max(pos2(full.right() - CONTROL, full.top()), full.max);
+        ui.scope_builder(UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)), |ui| {
+            let x = Button { icon: icons::X, icon_size: 14.0, label: None, selected: false, filled: false };
+            clear = button(ui, x).on_hover_text("Effacer les filtres rapides").clicked();
+        });
+    }
+    let left = Rect::from_min_max(full.min, pos2(full.right() - clear_width, full.bottom()));
+    ui.scope_builder(UiBuilder::new().max_rect(left).layout(Layout::left_to_right(Align::Center)), |ui| {
+        ui.set_clip_rect(ui.clip_rect().intersect(left));
+        ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
+        let label = format!("Aujourd'hui {}", counts.today);
+        let today = Button { icon: icons::CLOCK, icon_size: 14.0, label: Some(&label), selected: filter.since.is_some(), filled: false };
+        let tip = "Fichiers modifiés ou créés aujourd'hui";
+        if button(ui, today).on_hover_text(tip).clicked() {
+            filter.since = if filter.since.is_some() { None } else { Some(since) };
+        }
+        let chips = type_chips(counts, &filter.types);
+        if !chips.is_empty() {
+            separator(ui, p, true);
+        }
+        for (name, count) in chips {
+            let label = format!("{name} {count}");
+            let chip = Button { icon: "", icon_size: 14.0, label: Some(&label), selected: filter.types.contains(&name), filled: false };
+            if button(ui, chip).clicked() && !filter.types.remove(&name) {
+                filter.types.insert(name);
+            }
+        }
+    });
+    if clear {
+        filter.since = None;
+        filter.types.clear();
+    }
 }
 
 /// `folder` holds the active tab's settings; its controls are disabled when no tab is open.
@@ -604,5 +660,26 @@ mod tests {
         assert_eq!(r.filter_width, 100.0);
         let r = fit(responsive(600.0), 0.0, fake_required);
         assert_eq!(r.filter_width, 100.0);
+    }
+
+    fn counts(types: &[(&str, usize)]) -> QuickCounts {
+        QuickCounts { today: 0, types: types.iter().map(|(n, c)| ((*n).to_owned(), *c)).collect() }
+    }
+
+    #[test]
+    fn type_chips_hide_for_a_single_type_unless_one_is_selected() {
+        let one = counts(&[("PNG", 4)]);
+        assert!(type_chips(&one, &BTreeSet::new()).is_empty());
+        assert_eq!(type_chips(&one, &["PNG".to_owned()].into()), [("PNG".to_owned(), 4)]);
+        assert!(type_chips(&counts(&[]), &BTreeSet::new()).is_empty());
+        let two = counts(&[("PNG", 4), ("JPG", 1)]);
+        assert_eq!(type_chips(&two, &BTreeSet::new()).len(), 2);
+    }
+
+    #[test]
+    fn type_chips_keep_a_selected_type_that_left_the_folder() {
+        let two = counts(&[("PNG", 4), ("JPG", 1)]);
+        let chips = type_chips(&two, &["GLB".to_owned()].into());
+        assert_eq!(chips.last(), Some(&("GLB".to_owned(), 0)));
     }
 }

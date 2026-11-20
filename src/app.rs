@@ -16,6 +16,7 @@ use crate::formats::{self, DecodeError};
 use crate::geometry::{self, BarGeometry, Fitted, PxRect};
 use crate::instance::Primary;
 use crate::layout::{Dir, LayoutKind};
+use crate::library::Filter;
 use crate::model::gpu::ModelRenderer;
 use crate::model::offscreen::build_renderer;
 use crate::platform;
@@ -976,6 +977,7 @@ fn preview_info(tab: &Tab) -> Option<preview_view::Info> {
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join(" · "),
+        dates: status::dates_text(entry),
         rel_dir: entry.rel_dir.clone(),
         triangles: entry.triangles,
         position: (preview.index + 1, tab.gallery.order().len()),
@@ -1095,7 +1097,11 @@ impl ImageMozApp {
         let mut settings = win
             .active_tab()
             .map_or_else(FolderSettings::default, |t| FolderSettings { recursive: t.recursive, sort: t.sort, flat: t.flat });
-        let mut filter = win.active_tab().map_or_else(String::new, |t| t.gallery.filter().to_owned());
+        let since = status::start_of_today();
+        let mut filter = win.active_tab().map_or_else(Filter::default, |t| t.gallery.filter().clone());
+        if let Some(start) = &mut filter.since {
+            *start = since;
+        }
         let has_tab = win.active_tab().is_some();
         let events = if previewing || win.tabs.is_empty() {
             toolbar::ToolbarEvents::default()
@@ -1104,14 +1110,22 @@ impl ImageMozApp {
             egui::Panel::top(Id::new(("toolbar", id)))
                 .frame(frame)
                 .exact_size(toolbar::HEIGHT)
-                .show(ui, |ui| toolbar::show(ui, &mut self.config, &mut settings, &mut filter, has_tab))
+                .show(ui, |ui| toolbar::show(ui, &mut self.config, &mut settings, &mut filter.text, has_tab))
                 .inner
         };
+        if has_tab && !previewing {
+            let counts = self.windows.state_mut(id).active_tab_mut().map(|t| t.gallery.quick_counts(&t.library, since).clone());
+            let frame = Frame::NONE.fill(theme::palette(&ctx).toolbar_bg).inner_margin(Margin::symmetric(10, 0));
+            egui::Panel::top(Id::new(("quick-filters", id)))
+                .frame(frame)
+                .exact_size(toolbar::QUICK_HEIGHT)
+                .show(ui, |ui| toolbar::quick_row(ui, &mut filter, &counts.unwrap_or_default(), since));
+        }
         if !previewing
             && let Some(tab) = self.windows.state_mut(id).active_tab_mut()
-            && tab.gallery.filter() != filter
+            && *tab.gallery.filter() != filter
         {
-            tab.gallery.set_filter(&filter);
+            tab.gallery.set_filter(filter);
             ctx.request_repaint();
         }
         let tab = self.windows.state(id).active_tab();

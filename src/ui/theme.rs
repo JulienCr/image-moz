@@ -315,6 +315,7 @@ pub mod icons {
     pub const ARROWS_DOWN_UP: &str = "\u{e098}";
     pub const MAGNIFYING_GLASS: &str = "\u{e30c}";
     pub const X: &str = "\u{e4f6}";
+    pub const CLOCK: &str = "\u{e19a}";
     pub const PLUS: &str = "\u{e3d4}";
     pub const PUSH_PIN: &str = "\u{e3e2}";
     pub const CUBE: &str = "\u{e1da}";
