@@ -52,6 +52,16 @@ fn extension(path: &Path) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
+/// Upper-case type label with aliases merged (`jpeg` is `JPG`, `tiff` is `TIF`).
+pub fn type_label(path: &Path) -> Option<String> {
+    let ext = extension(path)?;
+    Some(match ext.as_str() {
+        "jpeg" => "JPG".to_owned(),
+        "tiff" => "TIF".to_owned(),
+        _ => ext.to_ascii_uppercase(),
+    })
+}
+
 pub fn kind(path: &Path) -> Option<MediaKind> {
     let ext = extension(path)?;
     if EXTENSIONS.contains(&ext.as_str()) {

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::epaint::RectShape;
 use eframe::egui::text::{LayoutJob, TextFormat};
@@ -17,7 +17,7 @@ use super::status;
 use crate::formats;
 use crate::config::{self, Config};
 use crate::layout::{self, BentoRule, Layout, LayoutItem, LayoutKind, LayoutSection};
-use crate::library::{Entry, FsChange, Library, Section, SortOrder};
+use crate::library::{Entry, Filter, FsChange, Library, QuickCounts, Section, SortOrder};
 use crate::selection::Selection;
 use crate::thumbs::{
     DiskCache, ThumbJob, ThumbKey, ThumbOutcome, ThumbPipeline, ThumbResult, key_for,
@@ -213,8 +213,10 @@ pub struct Gallery {
     /// First visible tile and its y relative to the viewport top, from the previous frame.
     anchor: Option<(PathBuf, f32)>,
     reset_scroll: bool,
-    /// Name filter as typed; kept across `reset`.
-    filter: String,
+    /// Name and quick filters; kept across `reset`.
+    filter: Filter,
+    /// Chip counts with the library version and start of day they were computed for.
+    quick_counts: Option<(u64, SystemTime, QuickCounts)>,
     /// Bumped on every rebuild of `order`.
     order_version: u64,
     arrivals: Arrivals,
@@ -477,6 +479,21 @@ fn draw_header(ui: &Ui, rect: Rect, hovered: bool, meta: &SectionMeta, new_count
     }
 }
 
+/// `« chat » · Aujourd'hui · PNG, JPG`: the active criteria, for the empty state.
+fn filter_description(filter: &Filter) -> String {
+    let mut parts = Vec::new();
+    if !filter.text.trim().is_empty() {
+        parts.push(format!("« {} »", filter.text.trim()));
+    }
+    if filter.since.is_some() {
+        parts.push("Aujourd'hui".to_owned());
+    }
+    if !filter.types.is_empty() {
+        parts.push(filter.types.iter().map(String::as_str).collect::<Vec<_>>().join(", "));
+    }
+    parts.join(" · ")
+}
+
 fn tooltip_ui(ui: &mut Ui, entry: &Entry, texture: Option<(TextureId, Vec2)>, recursive: bool, p: &Palette) {
     Frame::NONE.inner_margin(Margin::same(2)).show(ui, |ui| {
         let width = TOOLTIP_WIDTH - ui.spacing().menu_margin.sum().x - 4.0;
@@ -658,7 +675,8 @@ impl Gallery {
             viewport_h: 0.0,
             anchor: None,
             reset_scroll: false,
-            filter: String::new(),
+            filter: Filter::default(),
+            quick_counts: None,
             order_version: 0,
             arrivals: Arrivals::default(),
         }
@@ -698,23 +716,36 @@ impl Gallery {
         self.reset_scroll = true;
     }
 
-    pub fn filter(&self) -> &str {
+    pub fn filter(&self) -> &Filter {
         &self.filter
     }
 
-    /// Narrows the gallery to names containing `text` and returns the view to the top.
-    pub fn set_filter(&mut self, text: &str) {
-        if self.filter == text {
+    /// Narrows the gallery to `filter` and returns the view to the top.
+    pub fn set_filter(&mut self, filter: Filter) {
+        if self.filter == filter {
             return;
         }
-        self.filter = text.to_owned();
+        self.filter = filter;
         self.library_changed();
         self.scroll_to_top();
     }
 
+    pub fn clear_filter(&mut self) {
+        self.set_filter(Filter::default());
+    }
+
+    /// Chip counts over the whole library, recomputed when it changes or the day rolls over.
+    pub fn quick_counts(&mut self, library: &Library, since: SystemTime) -> &QuickCounts {
+        let stale = self.quick_counts.as_ref().is_none_or(|(v, s, _)| *v != self.lib_version || *s != since);
+        if stale {
+            self.quick_counts = Some((self.lib_version, since, library.quick_counts(since)));
+        }
+        self.quick_counts.as_ref().map(|(_, _, c)| c).expect("set above")
+    }
+
     /// Images matching the filter, across collapsed sections too; `None` when no filter is set.
     pub fn match_count(&self) -> Option<usize> {
-        if self.filter.trim().is_empty() {
+        if !self.filter.is_active() {
             return None;
         }
         Some(self.sections.iter().map(|s| s.items.len()).sum())
@@ -957,9 +988,10 @@ impl Gallery {
             ui.add_space(((area.height() - 150.0) / 2.0).max(0.0));
             label(ui, RichText::new(icons::MAGNIFYING_GLASS).font(theme::icon_font(36.0)).color(p.text_weak.gamma_multiply(0.6)));
             label(ui, RichText::new("Aucun fichier ne correspond au filtre").font(semibold(15.0)).color(p.text));
-            let line = format!("« {} » · 0 sur {}", self.filter.trim(), status::images_text(total));
+            let line = format!("{} · 0 sur {}", filter_description(&self.filter), status::images_text(total));
             label(ui, RichText::new(line).size(12.5).color(p.text_weak));
-            let button = egui::Button::new(RichText::new("Effacer le filtre").color(p.text))
+            let clear_label = if self.filter.has_quick() { "Effacer les filtres" } else { "Effacer le filtre" };
+            let button = egui::Button::new(RichText::new(clear_label).color(p.text))
                 .fill(p.button_fill)
                 .stroke(Stroke::new(1.0, p.border))
                 .corner_radius(CornerRadius::same(6))
@@ -967,7 +999,7 @@ impl Gallery {
             clear = ui.add(button).clicked();
         });
         if clear {
-            self.set_filter("");
+            self.clear_filter();
             ui.ctx().request_repaint();
         }
     }
@@ -1347,7 +1379,7 @@ mod tests {
     }
 
     fn probe(thumbs: &mut Thumbs, gallery: &mut Gallery, library: &Library) {
-        gallery.sections = library.sections(SortOrder::default(), "", false);
+        gallery.sections = library.sections(SortOrder::default(), &Filter::default(), false);
         gallery.library_changed();
         gallery.update_probes(thumbs, library);
     }
@@ -1383,6 +1415,17 @@ mod tests {
     }
 
     #[test]
+    fn filter_description_lists_every_active_criterion() {
+        let filter = Filter {
+            text: " chat ".to_owned(),
+            since: Some(SystemTime::UNIX_EPOCH),
+            types: ["PNG".to_owned(), "JPG".to_owned()].into(),
+        };
+        assert_eq!(filter_description(&filter), "« chat » · Aujourd'hui · JPG, PNG");
+        assert_eq!(filter_description(&Filter::named("x")), "« x »");
+    }
+
+    #[test]
     fn filter_and_flat_rebuild_the_layout_on_next_show() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["cat.png", "dog.png", "sub/cat2.png"] {
@@ -1399,14 +1442,24 @@ mod tests {
         assert_eq!(gallery.layout().headers.len(), 2);
         assert_eq!(gallery.match_count(), None);
 
-        gallery.set_filter("CAT");
+        gallery.set_filter(Filter::named("CAT"));
         show_once(&ctx, &mut thumbs, &mut gallery, &library, dir.path(), false);
         assert_eq!(gallery.order().len(), 2);
         assert_eq!(gallery.match_count(), Some(2));
 
-        gallery.set_filter("");
+        gallery.clear_filter();
         show_once(&ctx, &mut thumbs, &mut gallery, &library, dir.path(), false);
         assert_eq!(gallery.order().len(), 3);
+
+        let quick = |types: &[&str]| Filter { types: types.iter().map(|t| (*t).to_owned()).collect(), ..Filter::default() };
+        gallery.set_filter(quick(&["JPG"]));
+        show_once(&ctx, &mut thumbs, &mut gallery, &library, dir.path(), false);
+        assert_eq!((gallery.order().len(), gallery.match_count()), (0, Some(0)));
+        gallery.set_filter(quick(&["PNG"]));
+        show_once(&ctx, &mut thumbs, &mut gallery, &library, dir.path(), false);
+        assert_eq!((gallery.order().len(), gallery.match_count()), (3, Some(3)));
+        gallery.clear_filter();
+        show_once(&ctx, &mut thumbs, &mut gallery, &library, dir.path(), false);
 
         show_once(&ctx, &mut thumbs, &mut gallery, &library, dir.path(), true);
         assert_eq!(gallery.order().len(), 3);

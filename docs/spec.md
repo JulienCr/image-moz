@@ -101,9 +101,27 @@ pouvant contenir des milliers d'images.
 
 ## 7. Infos affichées
 
-Rien sur les tuiles. Au survol : nom, dimensions, poids du fichier (et chemin
-relatif en mode récursif). Une barre d'état en bas affiche la même chose pour
-l'image survolée ou sélectionnée, plus le nombre d'images et la sélection.
+Rien sur les tuiles. Au survol : nom, dimensions, poids du fichier, dates de
+modification et de création (et chemin relatif en mode récursif). Une barre
+d'état en bas affiche la même chose pour l'image survolée ou sélectionnée, plus
+le nombre d'images et la sélection. La bannière de l'aperçu plein cadre reprend
+les deux dates.
+
+Les dates sont relatives quand elles sont récentes : `aujourd'hui 14:32`,
+`hier 09:10`, sinon `12 nov. 2026 14:32` (heure locale, jours calendaires).
+
+### Filtres
+
+Le champ de la barre d'outils filtre sur le nom. Une rangée de puces sous la
+barre d'outils ajoute des filtres rapides : « Aujourd'hui » (fichiers modifiés
+ou créés depuis minuit) et un type par extension présente (`JPEG` compte comme
+`JPG`, `TIFF` comme `TIF`), à sélection multiple. Les types sélectionnés
+s'additionnent entre eux ; nom, « Aujourd'hui » et types se combinent en ET. Les
+nombres portent sur tout le dossier, pas sur le résultat du filtre. Les types
+sont masqués quand le dossier n'en contient qu'un. Les filtres sont propres à
+l'onglet et ne sont pas conservés. Le compteur de la barre d'état
+(`17 / 48 images (filtre)`) et l'état « Aucun fichier ne correspond » en tiennent
+compte.
 
 ## 8. Sélection et clavier
 
