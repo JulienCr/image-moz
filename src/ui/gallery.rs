@@ -491,6 +491,13 @@ fn tooltip_ui(ui: &mut Ui, entry: &Entry, texture: Option<(TextureId, Vec2)>, re
         }
         ui.add(egui::Label::new(RichText::new(&entry.name).font(semibold(13.0)).color(p.text)).truncate());
         ui.label(RichText::new(status::meta_text(entry)).font(FontId::monospace(11.5)).color(p.text_muted));
+        for (label, date) in status::date_parts(entry) {
+            let mut job = LayoutJob::default();
+            let font = FontId::monospace(11.5);
+            job.append(&status::capitalized(label), 0.0, TextFormat::simple(font.clone(), p.text_weak));
+            job.append(&format!(" {date}"), 0.0, TextFormat::simple(font, p.text_muted));
+            ui.label(job);
+        }
         if recursive && !entry.rel_dir.is_empty() {
             ui.label(RichText::new(&entry.rel_dir).size(12.0).color(p.text_weak));
         }

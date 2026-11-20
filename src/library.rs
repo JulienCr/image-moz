@@ -15,6 +15,8 @@ pub struct Entry {
     pub rel_dir: String,
     pub name: String,
     pub mtime: SystemTime,
+    /// Not every filesystem records a creation time.
+    pub created: Option<SystemTime>,
     pub size: u64,
     pub dims: Option<(u32, u32)>,
     /// Triangle count of a 3D model, once its thumbnail has been made.
@@ -81,6 +83,7 @@ fn make_entry(path: &Path, rel_dir: String) -> Option<Entry> {
         rel_dir,
         name: path.file_name()?.to_string_lossy().into_owned(),
         mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        created: meta.created().ok(),
         size: meta.len(),
         dims: None,
         triangles: None,
@@ -149,6 +152,7 @@ impl Library {
                 if let Some(e) = self.entries.get_mut(&key) {
                     if let Ok(m) = p.metadata() {
                         e.mtime = m.modified().unwrap_or(e.mtime);
+                        e.created = m.created().ok().or(e.created);
                         e.size = m.len();
                     }
                     e.dims = None;

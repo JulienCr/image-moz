@@ -976,6 +976,7 @@ fn preview_info(tab: &Tab) -> Option<preview_view::Info> {
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join(" · "),
+        dates: status::dates_text(entry),
         rel_dir: entry.rel_dir.clone(),
         triangles: entry.triangles,
         position: (preview.index + 1, tab.gallery.order().len()),

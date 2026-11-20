@@ -27,6 +27,8 @@ pub struct Info {
     pub name: String,
     /// "2048 × 1365 · 1,9 Mo".
     pub meta: String,
+    /// "modifié hier 09:10 · créé 12 nov. 2026 14:32".
+    pub dates: String,
     pub rel_dir: String,
     /// Fallback for a model whose scene is not loaded yet.
     pub triangles: Option<u32>,

@@ -1,3 +1,6 @@
+use std::time::SystemTime;
+
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDateTime, TimeZone, Timelike};
 use eframe::egui::{Align, Color32, Context, Frame, Label, Layout, Margin, RichText, Sense, Ui, vec2};
 
 use super::theme;
@@ -19,6 +22,52 @@ pub fn format_size(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.1} {}", UNITS[unit]).replace('.', ",")
+}
+
+const MONTHS: [&str; 12] =
+    ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
+
+/// `aujourd'hui 14:32`, `hier 09:10` or `12 nov. 2026 14:32`; absolute for a future date.
+pub fn date_text(t: NaiveDateTime, now: NaiveDateTime) -> String {
+    let clock = format!("{:02}:{:02}", t.hour(), t.minute());
+    match (now.date() - t.date()).num_days() {
+        0 => format!("aujourd'hui {clock}"),
+        1 => format!("hier {clock}"),
+        _ => format!("{} {} {} {clock}", t.day(), MONTHS[t.month0() as usize], t.year()),
+    }
+}
+
+/// Uppercases the first letter, for a text that starts a line.
+pub fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
+}
+
+/// [`date_text`] in the local time zone, relative to the current time.
+pub fn local_date_text(t: SystemTime) -> String {
+    date_text(DateTime::<Local>::from(t).naive_local(), Local::now().naive_local())
+}
+
+/// Local midnight of the current day.
+pub fn start_of_today() -> SystemTime {
+    let midnight = Local::now().date_naive().and_hms_opt(0, 0, 0).unwrap_or_default();
+    // Midnight can be skipped by a DST change; the next hour is the first valid instant then.
+    let start = Local.from_local_datetime(&midnight).earliest().or_else(|| {
+        Local.from_local_datetime(&(midnight + Duration::hours(1))).earliest()
+    });
+    start.map_or(SystemTime::UNIX_EPOCH, SystemTime::from)
+}
+
+/// (label, date) pairs for the modification and, when known, creation time.
+pub fn date_parts(entry: &Entry) -> Vec<(&'static str, String)> {
+    let mut parts = vec![("modifié", local_date_text(entry.mtime))];
+    parts.extend(entry.created.map(|t| ("créé", local_date_text(t))));
+    parts
+}
+
+/// `modifié … · créé …`, for text that continues a line.
+pub fn dates_text(entry: &Entry) -> String {
+    date_parts(entry).iter().map(|(label, date)| format!("{label} {date}")).collect::<Vec<_>>().join(" · ")
 }
 
 /// `12 345 triangles` with a narrow no-break space between thousands.
@@ -129,6 +178,9 @@ fn entry_info(ui: &mut Ui, entry: &Entry, recursive: bool) {
         ui.label(mono(dims, p.text_muted));
     }
     ui.label(mono(format_size(entry.size), p.text_muted));
+    for (label, date) in date_parts(entry) {
+        ui.label(text(format!("{label} {date}"), p.text_weak));
+    }
     if recursive && !entry.rel_dir.is_empty() {
         ui.label(text(&entry.rel_dir, p.text_weak));
     }
@@ -166,7 +218,6 @@ pub fn show(ui: &mut Ui, info: &StatusInfo) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::time::SystemTime;
 
     fn entry(size: u64, dims: Option<(u32, u32)>, rel_dir: &str) -> Entry {
         Entry {
@@ -174,6 +225,7 @@ mod tests {
             rel_dir: rel_dir.to_string(),
             name: "a.png".to_string(),
             mtime: SystemTime::UNIX_EPOCH,
+            created: None,
             size,
             dims,
             triangles: None,
@@ -229,5 +281,41 @@ mod tests {
         assert_eq!(images_text(12), "12 images");
         assert_eq!(selected_text(0), "0 sélectionnée");
         assert_eq!(selected_text(3), "3 sélectionnées");
+    }
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, mo, d).unwrap().and_hms_opt(h, mi, 0).unwrap()
+    }
+
+    #[test]
+    fn dates_are_relative_when_recent() {
+        let now = at(2026, 11, 20, 15, 0);
+        assert_eq!(date_text(at(2026, 11, 20, 14, 32), now), "aujourd'hui 14:32");
+        assert_eq!(date_text(at(2026, 11, 19, 9, 10), now), "hier 09:10");
+        assert_eq!(date_text(at(2026, 11, 12, 14, 32), now), "12 nov. 2026 14:32");
+    }
+
+    #[test]
+    fn dates_follow_calendar_days_not_24_hours() {
+        let now = at(2026, 11, 20, 0, 1);
+        assert_eq!(date_text(at(2026, 11, 19, 23, 59), now), "hier 23:59");
+        assert_eq!(date_text(at(2026, 11, 20, 0, 1), now), "aujourd'hui 00:01");
+        assert_eq!(date_text(at(2026, 11, 18, 23, 59), now), "18 nov. 2026 23:59");
+    }
+
+    #[test]
+    fn older_dates_show_the_year_and_future_dates_are_absolute() {
+        let now = at(2026, 1, 1, 10, 0);
+        assert_eq!(date_text(at(2025, 12, 31, 8, 5), now), "hier 08:05");
+        assert_eq!(date_text(at(2024, 8, 3, 8, 5), now), "3 août 2024 08:05");
+        assert_eq!(date_text(at(2026, 1, 2, 8, 5), now), "2 janv. 2026 08:05");
+        assert_eq!(date_text(at(2026, 3, 2, 8, 5), now), "2 mars 2026 08:05");
+    }
+
+    #[test]
+    fn capitalized_handles_accents_and_empty() {
+        assert_eq!(capitalized("aujourd'hui 14:32"), "Aujourd'hui 14:32");
+        assert_eq!(capitalized("été"), "Été");
+        assert_eq!(capitalized(""), "");
     }
 }
