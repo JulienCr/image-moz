@@ -137,13 +137,15 @@ fn sort_label(sort: SortOrder) -> &'static str {
         SortOrder::DateAsc => "Date ↑",
         SortOrder::NameAsc => "Nom A→Z",
         SortOrder::NameDesc => "Nom Z→A",
+        SortOrder::SizeDesc => "Taille ↓",
+        SortOrder::SizeAsc => "Taille ↑",
     }
 }
 
 fn sort_icon(sort: SortOrder) -> &'static str {
     match sort {
-        SortOrder::DateDesc | SortOrder::NameDesc => icons::SORT_DESCENDING,
-        SortOrder::DateAsc | SortOrder::NameAsc => icons::SORT_ASCENDING,
+        SortOrder::DateDesc | SortOrder::NameDesc | SortOrder::SizeDesc => icons::SORT_DESCENDING,
+        SortOrder::DateAsc | SortOrder::NameAsc | SortOrder::SizeAsc => icons::SORT_ASCENDING,
     }
 }
 
@@ -471,7 +473,7 @@ pub fn show(
             }
             let width = if narrow.sort_label { SORT_WIDTH } else { SORT_COMPACT_WIDTH };
             let response = combo(ui, "sort_order", job, width, |ui| {
-                for sort in [SortOrder::DateDesc, SortOrder::DateAsc, SortOrder::NameAsc, SortOrder::NameDesc] {
+                for sort in [SortOrder::DateDesc, SortOrder::DateAsc, SortOrder::NameAsc, SortOrder::NameDesc, SortOrder::SizeDesc, SortOrder::SizeAsc] {
                     ui.selectable_value(&mut folder.sort, sort, sort_label(sort));
                 }
             });
